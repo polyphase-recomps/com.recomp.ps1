@@ -1,0 +1,15 @@
+{
+    "name": "com.recomp.ps1",
+    "author": "",
+    "description": "PS1 recompilation runtime: builds 100%-decompiled PS1 games natively and plays them with the Ps1Player node",
+    "version": "1.0.0",
+    "native": {
+        "target": "engine",
+        "sourceDir": "Source",
+        "binaryName": "com.recomp.ps1",
+        "entrySymbol": "PolyphasePlugin_GetDesc",
+        "apiVersion": 3,
+        "resolveMode": "source",
+        "binaries": []
+    }
+}

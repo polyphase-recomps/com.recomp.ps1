@@ -1,0 +1,14 @@
+# --- Generated from a game: never commit ---------------------------------------------
+# Setup Dependencies (or a game package's build.ps1 -Guest wasm) translates each game
+# into Source/Guest/<game> from the user's decomp checkout and disc. It's large,
+# rebuilt on every machine, and derived from the game.
+Source/Guest/
+
+# --- Build output --------------------------------------------------------------------
+Runtime/build/
+
+# --- Tools and editors ---------------------------------------------------------------
+__pycache__/
+*.pyc
+.vs/
+*.vcxproj.user
