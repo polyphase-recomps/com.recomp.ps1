@@ -329,8 +329,9 @@ void SetFogNear(long a, long h)
 {
     long dqa, dqb;
 
+    /* fog from `a` (IR0 0) to 5a (IR0 ONE): DQB = 1.25 * 2^24, DQA = -a * 5a / 4a * 256 / h */
     if (h == 0) h = 1;
-    dqa = -((a * 64) / h);
+    dqa = -((a * 320) / h);
     dqb = 0x1400000;
     if (dqa < -0x8000) dqa = -0x8000;
     if (dqa > 0x7FFF) dqa = 0x7FFF;
@@ -490,4 +491,47 @@ void NormalColorDpq(SVECTOR *v0, CVECTOR *v1, long p, CVECTOR *v2)
     port_gte_write_data(8, p);
     port_gte_op(GTE_CMD_NCDS);
     *(long *)v2 = port_gte_read_data(22);
+}
+
+/* GTE OP (sf = 0) through the rotation diagonal and IR: v2 = v0 x v1. The GTE takes
+ * 16-bit inputs (the low halves of v0 and v1). */
+void OuterProduct0(VECTOR *v0, VECTOR *v1, VECTOR *v2)
+{
+    long long ax = (short)v0->vx, ay = (short)v0->vy, az = (short)v0->vz;
+    long long bx = (short)v1->vx, by = (short)v1->vy, bz = (short)v1->vz;
+
+    v2->vx = (long)(ay * bz - az * by);
+    v2->vy = (long)(az * bx - ax * bz);
+    v2->vz = (long)(ax * by - ay * bx);
+}
+
+/* The same, shifted by 12 (sf = 1). */
+void OuterProduct12(VECTOR *v0, VECTOR *v1, VECTOR *v2)
+{
+    VECTOR r;
+
+    OuterProduct0(v0, v1, &r);
+    v2->vx = r.vx >> 12;
+    v2->vy = r.vy >> 12;
+    v2->vz = r.vz >> 12;
+}
+
+/* GTE SQR (sf = 0): each component of v0 squared (16-bit inputs). */
+VECTOR *Square0(VECTOR *v0, VECTOR *v1)
+{
+    long x = (short)v0->vx, y = (short)v0->vy, z = (short)v0->vz;
+
+    v1->vx = x * x;
+    v1->vy = y * y;
+    v1->vz = z * z;
+    return v1;
+}
+
+VECTOR *Square12(VECTOR *v0, VECTOR *v1)
+{
+    Square0(v0, v1);
+    v1->vx >>= 12;
+    v1->vy >>= 12;
+    v1->vz >>= 12;
+    return v1;
 }

@@ -14,6 +14,9 @@ void port_overlays_snapshot(void);
 
 #define EXE_HEADER_SIZE 0x800
 
+/* End of the executable's BSS: where the PS1 startup code starts the heap (libc2.c). */
+unsigned long port_boot_bss_end;
+
 static unsigned long rd32(const unsigned char *p)
 {
     return p[0] | ((unsigned long)p[1] << 8) | ((unsigned long)p[2] << 16) | ((unsigned long)p[3] << 24);
@@ -50,6 +53,13 @@ static void load_executable(void)
     }
     dst = (unsigned char *)b_addr;
     for (i = 0; i < b_size; i++) dst[i] = 0;
+    port_boot_bss_end = b_size ? b_addr + b_size : t_addr + t_size;
+    if (PS1_BSS_END > port_boot_bss_end)
+    {
+        /* the header has no BSS: the game package says where it ends (ps1_add_game BSS_END) */
+        for (i = port_boot_bss_end; i < PS1_BSS_END; i++) *(unsigned char *)i = 0;
+        port_boot_bss_end = PS1_BSS_END;
+    }
 }
 
 void port_game_entry(void)

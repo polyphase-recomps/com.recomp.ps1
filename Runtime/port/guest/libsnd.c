@@ -585,6 +585,7 @@ typedef struct
     unsigned char program[16], volume[16], pan[16], expression[16];
     short bend[16];
     int nrpn;
+    double rampL, rampR, rampStepL, rampStepR, rampTime; /* SsSeqSetCrescendo, seconds left */
 } Seq;
 
 #define NUM_SEQS 4
@@ -685,9 +686,8 @@ static void seq_note_on(int seqIndex, Seq *s, int channel, int note, int velocit
         v = seq_alloc_voice();
         if (!v) return;
         vol = velocity * s->volume[channel] / 127 * s->expression[channel] / 127;
+        /* the sequence's volume (SsSeqSetVol, crescendos) is applied while mixing */
         tone_volume(vab, prog, tone, vol, s->pan[channel], &l, &r);
-        l = l * s->volL / 127;
-        r = r * s->volR / 127;
         if (voice_start(v, vab, tone, note, 0, l, r))
         {
             v->seq = seqIndex + 1;
@@ -868,6 +868,7 @@ short SsSeqOpen(unsigned long *addr, short vab_id)
     if (s->tempo == 0) s->tempo = 500000;
     s->start = p + 15;
     s->volL = s->volR = 127;
+    s->rampTime = 0;
     s->tickAccum = 0;
     seq_reset_channels(s);
     seq_restart(s);
@@ -924,6 +925,53 @@ static int port_vsnprintf_wrap(char *buf, int cap, ...)
     return n < cap ? n : cap - 1;
 }
 
+/* ---- CD audio (XA from CD streams, libcd_stream.c) ---------------------------------------------- */
+#define XA_RING 16384 /* stereo frames at 44100 Hz */
+static short sXaRing[XA_RING * 2];
+static unsigned sXaRead, sXaWrite;
+static int sCdVolL = 0x7FFF, sCdVolR = 0x7FFF, sCdMix = 1;
+static int sMute;
+
+/* Queues stereo 44100 Hz samples of the CD input (XA audio); the mixer plays them. */
+void port_cd_audio_queue(const short *samples, int frames)
+{
+    int i;
+
+    for (i = 0; i < frames; i++)
+    {
+        if (sXaWrite - sXaRead >= XA_RING) sXaRead++; /* full: drop the oldest */
+        sXaRing[(sXaWrite % XA_RING) * 2] = samples[i * 2];
+        sXaRing[(sXaWrite % XA_RING) * 2 + 1] = samples[i * 2 + 1];
+        sXaWrite++;
+    }
+}
+
+/* Stereo frames queued and not played yet. */
+int port_cd_audio_queued(void)
+{
+    return (int)(sXaWrite - sXaRead);
+}
+
+/* Drops what is queued (the stream stopped). */
+void port_cd_audio_clear(void)
+{
+    sXaRead = sXaWrite;
+}
+
+static void xa_mix(int *l, int *r)
+{
+    int xl, xr;
+
+    if (sXaRead == sXaWrite) return;
+    xl = sXaRing[(sXaRead % XA_RING) * 2];
+    xr = sXaRing[(sXaRead % XA_RING) * 2 + 1];
+    sXaRead++;
+    if (!sCdMix || sMute) return;
+    /* the master volume scales the result by 127/2 below; CD input is not halved */
+    *l += (int)((long)xl * sCdVolL / 0x7FFF) * 2;
+    *r += (int)((long)xr * sCdVolR / 0x7FFF) * 2;
+}
+
 /* ---- mixer ------------------------------------------------------------------------------------- */
 static void seq_advance(double seconds)
 {
@@ -933,6 +981,16 @@ static void seq_advance(double seconds)
     {
         Seq *s = &sSeqs[i];
 
+        if (s->open && s->rampTime > 0)
+        {
+            double t = seconds < s->rampTime ? seconds : s->rampTime;
+
+            s->rampL += s->rampStepL * t;
+            s->rampR += s->rampStepR * t;
+            s->rampTime -= t;
+            s->volL = (int)(s->rampL + 0.5);
+            s->volR = (int)(s->rampR + 0.5);
+        }
         if (!s->open || !s->playing) continue;
         s->tickAccum += seconds * 1000000.0 / (double)s->tempo * (double)s->resolution;
         while (s->tickAccum >= 1.0)
@@ -1017,9 +1075,23 @@ void port_snd_render(int frames)
                     v->volR = v->baseR * vol / 127;
                     if (++v->autoElapsed >= v->autoTime) v->autoTime = 0;
                 }
-                render_voice_sample(v, &l, &r);
+                if (v->seq > 0 && v->seq <= NUM_SEQS)
+                {
+                    const Seq *s = &sSeqs[v->seq - 1];
+                    int vl = 0, vr = 0;
+
+                    render_voice_sample(v, &vl, &vr);
+                    l += vl * s->volL / 127;
+                    r += vr * s->volR / 127;
+                }
+                else
+                {
+                    render_voice_sample(v, &l, &r);
+                }
             }
             if (sReverbOn) reverb_process(&l, &r);
+            if (sMute) l = r = 0;
+            xa_mix(&l, &r);
             l = l * sMasterL / 127 / 2;
             r = r * sMasterR / 127 / 2;
             if (l > 32767) l = 32767;
@@ -1032,4 +1104,160 @@ void port_snd_render(int frames)
         done += chunk;
     }
     port_audio_push(out, frames);
+}
+
+/* ---- libsnd / libspu: more of the API ----------------------------------------------------------- */
+/* SsVabOpenHead: the header is copied (a game may load the body into the same buffer). */
+short SsVabOpenHead(unsigned char *addr, short vabid)
+{
+    static unsigned char *copies[NUM_VABS];
+    static unsigned long capacity[NUM_VABS];
+    unsigned long size, i;
+    int ps;
+
+    if (vabid < 0)
+    {
+        for (vabid = 0; vabid < NUM_VABS && sVabs[vabid].open; vabid++)
+        {
+        }
+    }
+    if (vabid < 0 || vabid >= NUM_VABS) return -1;
+    if (addr[0] != 'p' || addr[1] != 'B' || addr[2] != 'A' || addr[3] != 'V') return -1;
+    ps = *(const unsigned short *)(addr + 18);
+    size = 32 + 128 * 16 + (unsigned long)ps * 16 * 32 + 256 * 2;
+    if (capacity[vabid] < size)
+    {
+        copies[vabid] = (unsigned char *)port_alloc(size);
+        capacity[vabid] = size;
+    }
+    for (i = 0; i < size; i++) copies[vabid][i] = addr[i];
+    return SsVabOpenHeadSticky(copies[vabid], vabid, 0);
+}
+
+short SsUtGetVabHdr(short vabid, void *vabhdr)
+{
+    int i;
+
+    if (vabid < 0 || vabid >= NUM_VABS || !sVabs[vabid].open) return -1;
+    for (i = 0; i < 32; i++) ((unsigned char *)vabhdr)[i] = sVabs[vabid].header[i];
+    return 0;
+}
+
+short SsUtGetProgAtr(short vabid, short prog, void *progatr)
+{
+    int i;
+
+    if (vabid < 0 || vabid >= NUM_VABS || !sVabs[vabid].open || prog < 0 || prog > 127) return -1;
+    for (i = 0; i < (int)sizeof(ProgAtr); i++)
+        ((unsigned char *)progatr)[i] = ((const unsigned char *)&sVabs[vabid].progs[prog])[i];
+    return 0;
+}
+
+short SsUtGetVagAtr(short vabid, short prog, short tone, void *vagatr)
+{
+    const VagAtr *t;
+    int i;
+
+    if (vabid < 0 || vabid >= NUM_VABS || !sVabs[vabid].open) return -1;
+    t = vab_tone(&sVabs[vabid], prog, tone);
+    if (!t) return -1;
+    for (i = 0; i < (int)sizeof(VagAtr); i++) ((unsigned char *)vagatr)[i] = ((const unsigned char *)t)[i];
+    return 0;
+}
+
+/* Keys a tone on a free voice; returns the voice, or -1. */
+short SsUtKeyOn(short vabId, short prog, short tone, short note, short fine, short voll, short volr)
+{
+    int v;
+
+    for (v = 0; v < NUM_SPU_VOICES; v++)
+    {
+        if (!sVoices[v].active) return SsUtKeyOnV((short)v, vabId, prog, tone, note, fine, voll, volr);
+    }
+    return -1;
+}
+
+short SsUtKeyOff(short voice, short vabId, short prog, short tone, short note)
+{
+    return SsUtKeyOffV(voice);
+}
+
+char SsSetMute(char mode)
+{
+    sMute = mode != 0;
+    return 0;
+}
+
+void SsSeqPause(short seq_access_num)
+{
+    if (seq_access_num < 0 || seq_access_num >= NUM_SEQS || !sSeqs[seq_access_num].open) return;
+    sSeqs[seq_access_num].playing = 0;
+    seq_notes_off(seq_access_num, 0, 0, 1);
+}
+
+void SsSeqReplay(short seq_access_num)
+{
+    if (seq_access_num < 0 || seq_access_num >= NUM_SEQS || !sSeqs[seq_access_num].open) return;
+    sSeqs[seq_access_num].playing = 1;
+}
+
+static void seq_ramp(short seq_access_num, int vol, long ticks)
+{
+    Seq *s;
+    double seconds = ticks > 0 ? ticks / 60.0 : 0;
+    int toL, toR;
+
+    if (seq_access_num < 0 || seq_access_num >= NUM_SEQS || !sSeqs[seq_access_num].open) return;
+    s = &sSeqs[seq_access_num];
+    toL = s->volL + vol;
+    toR = s->volR + vol;
+    if (toL < 0) toL = 0;
+    if (toL > 127) toL = 127;
+    if (toR < 0) toR = 0;
+    if (toR > 127) toR = 127;
+    if (seconds <= 0)
+    {
+        s->volL = toL;
+        s->volR = toR;
+        s->rampTime = 0;
+        return;
+    }
+    s->rampL = s->volL;
+    s->rampR = s->volR;
+    s->rampStepL = (toL - s->volL) / seconds;
+    s->rampStepR = (toR - s->volR) / seconds;
+    s->rampTime = seconds;
+}
+
+/* Volume up by `vol` over `v_time` ticks (60 a second). */
+void SsSeqSetCrescendo(short seq_access_num, short vol, long v_time)
+{
+    seq_ramp(seq_access_num, vol, v_time);
+}
+
+void SsSeqSetDecrescendo(short seq_access_num, short vol, long v_time)
+{
+    seq_ramp(seq_access_num, -vol, v_time);
+}
+
+/* SpuCommonAttr (libspu.h) */
+typedef struct
+{
+    unsigned long mask;
+    short mvolL, mvolR, mvolmodeL, mvolmodeR, mvolxL, mvolxR;
+    short cdVolL, cdVolR;
+    long cdReverb, cdMix;
+    short extVolL, extVolR;
+    long extReverb, extMix;
+} PortSpuCommonAttr;
+
+void SpuSetCommonAttr(void *attrIn)
+{
+    const PortSpuCommonAttr *a = (const PortSpuCommonAttr *)attrIn;
+
+    if (a->mask & (1 << 0)) sMasterL = a->mvolL * 127 / 0x3FFF;
+    if (a->mask & (1 << 1)) sMasterR = a->mvolR * 127 / 0x3FFF;
+    if (a->mask & (1 << 6)) sCdVolL = a->cdVolL;
+    if (a->mask & (1 << 7)) sCdVolR = a->cdVolR;
+    if (a->mask & (1 << 9)) sCdMix = a->cdMix != 0;
 }

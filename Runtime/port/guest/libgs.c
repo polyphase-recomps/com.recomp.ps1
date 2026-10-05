@@ -90,6 +90,7 @@ void GsInitGraph(unsigned short x, unsigned short y, unsigned short intmode, uns
     CLIP2.h = (short)y;
     PSDBASEX[0] = PSDBASEX[1] = 0;
     PSDBASEY[0] = PSDBASEY[1] = 0;
+    if (!sOffsetByGpu) SetGeomOffset(0, 0);
 }
 
 void GsDefDispBuff(unsigned short x0, unsigned short y0, unsigned short x1, unsigned short y1)
@@ -125,6 +126,8 @@ void GsSwapDispBuff(void)
     GsDISPENV.disp.w = (short)HWD0;
     GsDISPENV.disp.h = (short)VWD0;
     PutDispEnv(&GsDISPENV);
+    /* libgs's swap also lifts the display mask (some games never call SetDispMask) */
+    SetDispMask(1);
 
     next = PSDIDX ? 0 : 1;
     PSDIDX = (short)next;
@@ -260,6 +263,20 @@ static u_long *put_drmode(u_long *p, u_long tpage, GsOT *ot, unsigned short pri)
     return p + 3;
 }
 
+/* 2D origin of libgs's sprites and boxes. With GsOFSGTE libgs adds the origin
+ * (POSITION: the screen centre after GsInit3D, or GsSetOrign's) to their coordinates
+ * (BGs and lines it leaves alone); the drawing area's own offset covers the buffer.
+ * With GsOFSGPU the GPU's drawing offset holds the origin already. */
+short port_gs_origin_x(void)
+{
+    return sOffsetByGpu ? 0 : POSITION.offx;
+}
+
+short port_gs_origin_y(void)
+{
+    return sOffsetByGpu ? 0 : POSITION.offy;
+}
+
 static u_long sprite_tpage(GsSPRITE *sp)
 {
     u_long tpage = sp->tpage & ~0x1E0;
@@ -292,7 +309,7 @@ void GsSortFastSprite(GsSPRITE *sp, GsOT *ot, unsigned short pri)
     s = p;
     s[0] = 4 << 24;
     s[1] = rgb_word(sprite_code(sp, 0x64), sp->r, sp->g, sp->b);
-    s[2] = ((u_long)(u_short)sp->y << 16) | (u_short)sp->x;
+    s[2] = ((u_long)(u_short)(sp->y + port_gs_origin_y()) << 16) | (u_short)(sp->x + port_gs_origin_x());
     s[3] = ((u_long)getClut(sp->cx, sp->cy) << 16) | ((u_long)sp->v << 8) | sp->u;
     s[4] = ((u_long)sp->h << 16) | sp->w;
     addPrim(ot->org + pri, s);
@@ -328,8 +345,8 @@ void GsSortSprite(GsSPRITE *sp, GsOT *ot, unsigned short pri)
     cx[1] = sp->w - sp->mx;   cy[1] = -sp->my;
     cx[2] = -sp->mx;          cy[2] = sp->h - sp->my;
     cx[3] = sp->w - sp->mx;   cy[3] = sp->h - sp->my;
-    ox = sp->x + sp->mx;
-    oy = sp->y + sp->my;
+    ox = sp->x + sp->mx + port_gs_origin_x();
+    oy = sp->y + sp->my + port_gs_origin_y();
 
     p[0] = 9 << 24;
     p[1] = rgb_word(sprite_code(sp, 0x2C), sp->r, sp->g, sp->b);
@@ -377,7 +394,7 @@ void GsSortBoxFill(GsBOXF *bp, GsOT *ot, unsigned short pri)
     if (bp->attribute & (1 << 30)) code |= 2;
     p[0] = 3 << 24;
     p[1] = rgb_word(code, bp->r, bp->g, bp->b);
-    p[2] = ((u_long)(u_short)bp->y << 16) | (u_short)bp->x;
+    p[2] = ((u_long)(u_short)(bp->y + port_gs_origin_y()) << 16) | (u_short)(bp->x + port_gs_origin_x());
     p[3] = ((u_long)bp->h << 16) | bp->w;
     addPrim(ot->org + pri, p);
     p += 4;
@@ -434,6 +451,10 @@ void GsInit3D(void)
     }
     else
     {
+        /* libgs puts the 3D origin at the screen centre here; GsOFSGTE applies it as
+         * the GTE's screen offset (sprites and boxes keep the drawing area's top-left) */
+        POSITION.offx = (short)(HWD0 / 2);
+        POSITION.offy = (short)(VWD0 / 2);
         SetGeomOffset(POSITION.offx, POSITION.offy);
     }
     identity(&GsIDMATRIX);
@@ -522,14 +543,14 @@ void GsSetLsMatrix(MATRIX *mp)
 }
 
 /* ---- coordinate systems --------------------------------------------------------------------- */
+/* As libgs: coord, super and flg only. param, workm and sub are left as they are (LSD
+ * sets param before it calls this; clearing it sent every node's rotation and scale
+ * through a NULL pointer). */
 void GsInitCoordinate2(GsCOORDINATE2 *super, GsCOORDINATE2 *base)
 {
-    base->flg = 0;
-    identity(&base->coord);
-    identity(&base->workm);
-    base->param = 0;
+    identity(&base->coord); /* libgs copies GsIDMATRIX */
     base->super = super;
-    base->sub = 0;
+    base->flg = 0;
     if (super != 0 && super != SCREEN)
     {
         super->sub = base;
@@ -563,22 +584,74 @@ void GsMulCoord3(MATRIX *m1, MATRIX *m2)
     *m1 = r;
 }
 
-/* Local-to-world of `c` into c->workm. */
+/* Local-to-world of `c` into c->workm (and `lw`), with libgs's cache (as in Sony's
+ * GsGetLws): workm is kept between frames. A coordinate computed this frame has
+ * flg == PSDCNT; a game marks one it changed with flg = 0. Walking up from `c`, the
+ * first coordinate computed this frame, or the root (its workm = coord when it is
+ * dirty or current), gives the starting matrix; with a root from an earlier frame the
+ * cached workm above the highest dirty coordinate is used, and with nothing dirty
+ * c's own cached workm, as it is. From there each coordinate below gets
+ * workm = super's workm x coord and flg = PSDCNT. Games rely on this: LSD writes
+ * workm.t of nodes itself and draws with the cached matrices. */
+#define COORD_CHAIN_MAX 100
+static void update_workm_lw(GsCOORDINATE2 *c, MATRIX *lw)
+{
+    GsCOORDINATE2 *chain[COORD_CHAIN_MAX + 1];
+    int n = 0, dirty = -1;
+
+    for (;;)
+    {
+        chain[n] = c;
+        if (c->super == 0 || c->super == SCREEN)
+        {
+            if (c->flg == PSDCNT || c->flg == 0)
+            {
+                c->workm = c->coord;
+                c->flg = PSDCNT;
+                *lw = c->workm;
+            }
+            else if (dirty < 0)
+            {
+                *lw = chain[0]->workm;
+                n = 0;
+            }
+            else
+            {
+                n = dirty + 1;
+                *lw = chain[n]->workm;
+            }
+            break;
+        }
+        if (c->flg == PSDCNT)
+        {
+            *lw = c->workm;
+            break;
+        }
+        if (c->flg == 0) dirty = n;
+        if (n == COORD_CHAIN_MAX)
+        {
+            /* deeper than libgs allows (its own table holds 100): start here */
+            *lw = c->workm;
+            break;
+        }
+        c = c->super;
+        n++;
+    }
+    while (n > 0)
+    {
+        n--;
+        GsMulCoord3(lw, &chain[n]->coord);
+        chain[n]->workm = *lw;
+        chain[n]->flg = PSDCNT;
+    }
+}
+
 static void update_workm(GsCOORDINATE2 *c, int depth)
 {
-    if (c->super != 0 && c->super != SCREEN && depth < 64)
-    {
-        MATRIX r;
+    MATRIX lw;
 
-        update_workm(c->super, depth + 1);
-        CompMatrix(&c->super->workm, &c->coord, &r);
-        c->workm = r;
-    }
-    else
-    {
-        c->workm = c->coord;
-    }
-    c->flg = PSDCNT;
+    (void)depth;
+    update_workm_lw(c, &lw);
 }
 
 void GsGetLw(GsCOORDINATE2 *m, MATRIX *out)
@@ -667,8 +740,7 @@ int GsSetRefView2(GsRVIEW2 *pv)
     GsWSMATRIX = m;
     apply_view_super(pv->super);
     GsWSMATRIX_ORG = GsWSMATRIX;
-    PSDCNT++;
-    if (PSDCNT == 0) PSDCNT = 1;
+    /* PSDCNT (the coordinate cache's frame) advances in GsSwapDispBuff only, as in libgs */
     return 0;
 }
 
@@ -688,6 +760,41 @@ int GsSetView2(GsVIEW2 *pv)
 }
 
 /* ---- TMD models ------------------------------------------------------------------------------------ */
+/* Words after the header of a TMD primitive packet of this flag/mode, or -1 for a type
+ * this runtime does not know. Mapped TMDs keep a run's packet count where the first
+ * packet's olen/ilen were (GsMapModelingData), so lengths come from the type. */
+static int tmd_packet_words(int flag, int mode)
+{
+    int quad = (mode & 8) != 0, tex = (mode & 4) != 0, iip = (mode & 0x10) != 0;
+    int unlit = (flag & 1) != 0, grad = (flag & 4) != 0;
+    int nv = quad ? 4 : 3, ncol, halves;
+
+    switch (mode & 0xE0)
+    {
+    case 0x20: /* polygon */
+        if (tex && !unlit)
+            ncol = 0;
+        else if (unlit)
+            ncol = iip ? nv : 1;
+        else
+            ncol = grad ? nv : 1;
+        if (unlit)
+            halves = nv;
+        else if (iip)
+            halves = nv * 2;
+        else
+            halves = nv + 1;
+        return (tex ? nv : 0) + ncol + (halves + 1) / 2;
+    case 0x40: /* line: colour(s), two vertex indices */
+        return (iip ? 2 : 1) + 1;
+    case 0x60: /* 3D sprite: vertex + tpage, uv + clut, and the size when it is free */
+        return (mode & 0x18) == 0 ? 3 : 2;
+    default:
+        return -1;
+    }
+}
+
+/* Relocates the TMD's object table (offsets -> addresses), as libgs does. */
 void GsMapModelingData(unsigned long *p)
 {
     u_long nobj, i;
@@ -709,9 +816,41 @@ void GsMapModelingData(unsigned long *p)
     p[0] |= 1;
 }
 
+/* Links object `n` of a mapped TMD to `objp`. With PS1_LIBGS_RUN_COUNTS (a game whose
+ * libgs did this, set in its package's DEFINES: LSD) it also does what that libgs's
+ * GsLinkObject4 does for the GsSortObject4 fast path: it groups the object's primitives
+ * into runs of one mode (the ABE bit aside) and writes each run's packet count over the
+ * first packet's olen/ilen. Other games' libgs left the packets as they are. */
 void GsLinkObject4(unsigned long tmd_base, GsDOBJ2 *objp, int n)
 {
-    objp->tmd = (unsigned long *)tmd_base + n * 7;
+    u_long *o = (u_long *)tmd_base + n * 7;
+
+    objp->tmd = o;
+#if PS1_LIBGS_RUN_COUNTS
+    {
+        u_long *prim = (u_long *)o[4], *first = prim;
+        u_long left = o[5], count = 0;
+        int runMode = -1;
+
+        while (left-- > 0)
+        {
+            int flag = (int)((prim[0] >> 16) & 0xFF), mode = (int)(prim[0] >> 24);
+            int words = tmd_packet_words(flag, mode);
+
+            if (runMode >= 0 && (mode & 0xFD) != runMode)
+            {
+                *(u_short *)first = (u_short)count;
+                count = 0;
+                first = prim;
+            }
+            runMode = mode & 0xFD;
+            if (words < 0) break; /* a type libgs does not know: it stops there too */
+            prim += 1 + words;
+            count++;
+        }
+        if (runMode >= 0) *(u_short *)first = (u_short)count;
+    }
+#endif
 }
 
 #define LM_NORMAL 0
@@ -743,9 +882,9 @@ static PACKET *tmd_draw(u_long *prim, SVECTOR *vtx, SVECTOR *nrm, PACKET *pk, in
     while (n-- > 0)
     {
         u_long hdr = p[0];
-        int ilen = (hdr >> 8) & 0xFF;
         int flag = (hdr >> 16) & 0xFF;
         int mode = (hdr >> 24) & 0xFF;
+        int ilen = tmd_packet_words(flag, mode);
         u_long *d = p + 1;
         int quad, tex, iip, unlit, grad, nv, ncol, i;
         u_long uvw[4];
@@ -757,6 +896,7 @@ static PACKET *tmd_draw(u_long *prim, SVECTOR *vtx, SVECTOR *nrm, PACKET *pk, in
         u_long *out;
         int words;
 
+        if (ilen < 0) break; /* unknown packet type: the rest cannot be walked */
         p += 1 + ilen;
         if ((mode & 0xE0) != 0x20) continue;
 

@@ -81,6 +81,15 @@ static DWORD sFixOrig;
 static unsigned sFixTried;
 static unsigned sFixCount;
 
+/*
+ * --debug-watch ADDR: a hardware data breakpoint (DR0) on the 4 bytes at ADDR, set on
+ * the game thread at start; every write to them is logged with the code address and
+ * the new value (symbolize with llvm-symbolizer --obj=<exe>). For memory corruption.
+ */
+#define WATCH_ARM_CODE 0xE0440002u
+static DWORD sWatchAddr;
+static unsigned sWatchCount;
+
 static DWORD *context_reg(CONTEXT *ctx, int i)
 {
     switch (i)
@@ -111,6 +120,23 @@ static LONG CALLBACK lowmem_handler(EXCEPTION_POINTERS *info)
     if (GetCurrentThreadId() != sGameThreadId)
     {
         return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (rec->ExceptionCode == WATCH_ARM_CODE)
+    {
+        ctx->Dr0 = sWatchAddr;
+        ctx->Dr7 = (ctx->Dr7 & ~0xF0003u) | 1u | (1u << 16) | (3u << 18); /* L0, write, 4 bytes */
+        ctx->Dr6 = 0;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (rec->ExceptionCode == EXCEPTION_SINGLE_STEP && (ctx->Dr6 & 1))
+    {
+        if (sWatchCount++ < 2000)
+        {
+            host_log("watch %08lX = %08lX, written at %08lX (esp %08lX)", sWatchAddr, *(DWORD *)sWatchAddr,
+                     ctx->Eip, ctx->Esp);
+        }
+        ctx->Dr6 = 0;
+        if (sFixReg < 0) return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (rec->ExceptionCode == EXCEPTION_SINGLE_STEP && sFixReg >= 0)
     {
@@ -279,6 +305,17 @@ static void run_on_stack(void (*fn)(void), void *top, void *bottom)
 void ps1_backend_run(void)
 {
     sGameThreadId = GetCurrentThreadId();
+    {
+        int watch[1];
+
+        if (port_debug_values("watch", watch, 1) == 1)
+        {
+            /* the handler sets the debug registers of the thread that raised this */
+            sWatchAddr = (DWORD)watch[0];
+            host_log("watching writes to %08lX", sWatchAddr);
+            RaiseException(WATCH_ARM_CODE, 0, 0, NULL);
+        }
+    }
     run_on_stack(port_game_entry, (void *)(PORT_STACK_TOP - 64), (void *)PORT_STACK_BOTTOM);
 }
 

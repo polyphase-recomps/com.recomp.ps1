@@ -6,6 +6,15 @@
 static unsigned sLastVsync;
 void port_snd_render(int frames);
 static int sPadReadsSinceVsync;
+static void (*sVSyncCallback)(void);
+static void cd_vsync(void);
+
+/* Runs `func` at every VSync (the PS1 runs it from the vertical blank interrupt). */
+int VSyncCallback(void (*func)(void))
+{
+    sVSyncCallback = func;
+    return 0;
+}
 
 void ResetCallback(void) {}
 void StopCallback(void) {}
@@ -37,6 +46,8 @@ long VSync(int mode)
     }
     sLastVsync = port_vblank_count();
     sPadReadsSinceVsync = 0;
+    cd_vsync();
+    if (sVSyncCallback) sVSyncCallback();
     {
         /* audio follows the video clock: 735 samples per 60 Hz frame */
         static unsigned long long produced;
@@ -86,10 +97,33 @@ typedef struct
 } CdlFILE;
 
 #define CdlSetloc 0x02
+#define CdlReadN 0x06
+#define CdlStop 0x08
+#define CdlPause 0x09
+#define CdlInit 0x0A
+#define CdlMute 0x0B
+#define CdlDemute 0x0C
+#define CdlSetfilter 0x0D
 #define CdlSetmode 0x0E
+#define CdlSeekL 0x15
+#define CdlSeekP 0x16
+#define CdlReadS 0x1B
+#define CdlModeStream 0x100
+#define CdlModeSF 0x08
+#define CdlComplete 0x02
 
 static int sLoc;
 static unsigned char sMode;
+static int sStreamMode; /* CdlModeStream, which does not fit the mode byte */
+static void (*sSyncCallback)(unsigned char, unsigned char *);
+static int sSyncPending;
+
+/* libcd_stream.c */
+void port_cd_stream_start(unsigned lba, int mode);
+void port_cd_stream_stop(void);
+void port_cd_set_mute(int muted);
+void port_cd_set_filter(int on, int file, int chan);
+static unsigned char sFilter[2];
 
 static int bcd(int v)
 {
@@ -122,16 +156,49 @@ int CdInit(void)
 
 int CdControl(unsigned char com, unsigned char *param, unsigned char *result)
 {
-    if (com == CdlSetloc && param)
+    if ((com == CdlSetloc || com == CdlSeekL || com == CdlSeekP) && param)
     {
         sLoc = CdPosToInt((CdlLOC *)param);
     }
     else if (com == CdlSetmode && param)
     {
         sMode = param[0];
+        port_cd_set_filter((sMode & CdlModeSF) != 0, sFilter[0], sFilter[1]);
+    }
+    else if (com == CdlSetfilter && param)
+    {
+        sFilter[0] = param[0];
+        sFilter[1] = param[1];
+        port_cd_set_filter((sMode & CdlModeSF) != 0, sFilter[0], sFilter[1]);
+    }
+    else if (com == CdlMute || com == CdlDemute)
+    {
+        port_cd_set_mute(com == CdlMute);
+    }
+    else if (com == CdlPause || com == CdlStop || com == CdlInit)
+    {
+        port_cd_stream_stop();
+    }
+    else if ((com == CdlReadS || com == CdlReadN) && sStreamMode)
+    {
+        port_cd_stream_start((unsigned)sLoc, sMode);
     }
     if (result) result[0] = 0x02;
+    /* the command completes at once; CdSyncCallback hears of it at the next VSync */
+    if (sSyncCallback) sSyncPending = 1;
     return 1;
+}
+
+/* Called from VSync: delivers a pending CdSyncCallback. */
+static void cd_vsync(void)
+{
+    if (sSyncPending && sSyncCallback)
+    {
+        static unsigned char result[8] = {0x02};
+
+        sSyncPending = 0;
+        sSyncCallback(CdlComplete, result);
+    }
 }
 
 int CdControlB(unsigned char com, unsigned char *param, unsigned char *result)
@@ -160,8 +227,15 @@ int CdRead(int sectors, unsigned long *buf, int mode)
     return 1;
 }
 
+/* Starts reading at the CdlSetloc position in `mode`; with CdlModeStream, a stream
+ * that libcd_stream.c serves. */
 int CdRead2(long mode)
 {
+    unsigned char m = (unsigned char)mode;
+
+    sStreamMode = (mode & CdlModeStream) != 0;
+    CdControl(CdlSetmode, &m, 0);
+    if (sStreamMode) port_cd_stream_start((unsigned)sLoc, (int)mode);
     return 1;
 }
 
@@ -198,19 +272,24 @@ CdlFILE *CdSearchFile(CdlFILE *fp, char *name)
 
 void CdInterrupt(void) {}
 
-/* Streaming / MDEC (movies are skipped in the port). */
-void StSetRing(unsigned long *ring_addr, unsigned long ring_size) {}
-void StUnSetRing(void) {}
-void StSetStream(unsigned long mode, unsigned long start_frame, unsigned long end_frame, void (*func1)(), void (*func2)()) {}
-void StClearRing(void) {}
-unsigned long StFreeRing(unsigned long *base) { return 0; }
-unsigned long StGetNext(unsigned long **addr, unsigned long **header) { return 1; }
-int StGetBackloc(void *loc) { return 0; }
-void StCdInterrupt(void) {}
-void DecDCTReset(int mode) {}
-void DecDCTin(unsigned long *buf, int mode) {}
-void DecDCTout(unsigned long *buf, int size) {}
-int DecDCToutSync(int mode) { return 0; }
-void *DecDCToutCallback(void (*func)()) { return 0; }
-int DecDCTvlc2(unsigned long *bs, unsigned long *buf, void *table) { return 0; }
-void DecDCTvlcBuild(void *table) {}
+/* Streaming (St*) is in libcd_stream.c, the MDEC (DecDCT*) in libpress.c. */
+
+void CdFlush(void) {}
+
+int CdSetDebug(int level)
+{
+    return 0;
+}
+
+void (*CdSyncCallback(void (*func)(unsigned char, unsigned char *)))(unsigned char, unsigned char *)
+{
+    void (*old)(unsigned char, unsigned char *) = sSyncCallback;
+
+    sSyncCallback = func;
+    return old;
+}
+
+void (*CdReadyCallback(void (*func)(unsigned char, unsigned char *)))(unsigned char, unsigned char *)
+{
+    return 0;
+}

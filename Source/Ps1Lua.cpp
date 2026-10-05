@@ -11,6 +11,10 @@
  *   Ps1.Result(id)               the request's result once the game ran it, else nil
  *   Ps1.Variables()              { {name=, type=, count=, help=}, ... }
  *   Ps1.Requests()               { {name=, help=}, ... }
+ *   Ps1.SetInputBlocked(bool)    true: the game gets no gamepad input (while a script's
+ *                                own menu is open); false gives it back
+ *   Ps1.IsInputBlocked()         true while blocked by a script or an open
+ *                                Ps1MenuController UI
  *
  * Requests run on the game thread between two frames, so Result is nil for at least
  * one frame: poll it from a Tick, e.g.
@@ -33,6 +37,7 @@
 #if LUA_ENABLED
 
 #include "Ps1GuestHost.h"
+#include "Ps1Widgets.h"
 #include "Plugins/PolyphaseEngineAPI.h"
 #include "../Runtime/port/include/port_bridge.h"
 
@@ -159,6 +164,18 @@ void SetString(lua_State* L, const char* field, const std::string& value)
     sApi->Lua_setfield(L, -2, field);
 }
 
+int SetInputBlocked(lua_State* L)
+{
+    Ps1Bind::SetInputBlocked(sApi->Lua_toboolean(L, 1) != 0);
+    return 0;
+}
+
+int IsInputBlocked(lua_State* L)
+{
+    sApi->Lua_pushboolean(L, Ps1Bind::IsInputBlocked());
+    return 1;
+}
+
 int Variables(lua_State* L)
 {
     const std::vector<Ps1GuestHost::BridgeVar> vars = Ps1GuestHost::BridgeVariables();
@@ -204,9 +221,10 @@ void Ps1Lua::Register(lua_State* L, PolyphaseEngineAPI* api)
     static const LuaReg kFuncs[] = {
         {"IsRunning", IsRunning}, {"Get", Get},           {"Set", Set},
         {"Request", Request},     {"Result", Result},     {"Variables", Variables},
-        {"Requests", Requests},   {nullptr, nullptr},
+        {"Requests", Requests},   {"SetInputBlocked", SetInputBlocked},
+        {"IsInputBlocked", IsInputBlocked},   {nullptr, nullptr},
     };
-    sApi->Lua_createtable(L, 0, 7);
+    sApi->Lua_createtable(L, 0, 9);
     sApi->LuaL_setfuncs(L, kFuncs, 0);
     sApi->Lua_setglobal(L, "Ps1");
 }

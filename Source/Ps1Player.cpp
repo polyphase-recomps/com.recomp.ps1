@@ -16,7 +16,14 @@
 
 #include "../Runtime/port/include/port_shm.h"
 #include "Ps1GuestHost.h"
+#include "Ps1Provider.h"
+#include "Ps1Widgets.h"
 #include "Wasm/ps1w_module.h"
+
+// com.recomp.mod.base: mod settings, resolution scaler, shared menus
+#include "ModBaseDisplay.h"
+#include "ModBaseSettings.h"
+#include "ModBaseWidgets.h"
 
 #if PLATFORM_WII
 #include <ogc/system.h>
@@ -304,6 +311,22 @@ static bool ReadJsonString(const std::string& text, const char* key, std::string
     return true;
 }
 
+// "holdskip=2 pausemenu=1" with name=value set (replaced, or added)
+static std::string SetOption(const std::string& options, const std::string& name, int value)
+{
+    std::istringstream words(options);
+    std::string word, out;
+    while (words >> word)
+    {
+        const std::string key = word.substr(0, word.find('='));
+        if (key != name)
+        {
+            out += (out.empty() ? "" : " ") + word;
+        }
+    }
+    return out + (out.empty() ? "" : " ") + name + "=" + std::to_string(value);
+}
+
 void Ps1Player::ResolveGameDefaults(std::string& exe, std::string& disc, std::string& saves) const
 {
     exe = mExePath;
@@ -349,6 +372,11 @@ void Ps1Player::ResolveGameDefaults(std::string& exe, std::string& disc, std::st
     }
     // game options / mods, "name=v1,v2 ..." (see Ps1GuestHost::SetOptions)
     ReadJsonString(text, "options", mGameOptions);
+    // the end user's mod settings (com.recomp.mod.base) override game.json's options
+    for (const auto& option : ModSettings::Get().StartupOptions(mGame))
+    {
+        mGameOptions = SetOption(mGameOptions, option.first, option.second);
+    }
 }
 
 // "holdskip=2 x=1,2" -> " --debug-holdskip 2 --debug-x 1,2" (the Windows host's options)
@@ -656,7 +684,7 @@ void Ps1Player::UpdateDisplayTexture(const uint8_t* pixels, unsigned int width, 
         texture = NewTransientAsset<Texture>();
         texture->SetName("T_Ps1Frame");
         texture->SetMipmapped(false);
-        texture->SetFilterType(FilterType::Nearest);
+        texture->SetFilterType(Recomp_DisplayFilterLinear() ? FilterType::Linear : FilterType::Nearest);
         texture->SetWrapMode(WrapMode::Clamp);
         texture->Init(width, height, (uint8_t*)pixels);
         texture->Create();
@@ -666,8 +694,16 @@ void Ps1Player::UpdateDisplayTexture(const uint8_t* pixels, unsigned int width, 
     if (Quad* quad = mBoundQuad.Get())
     {
         quad->SetTexture(texture);
+        // the resolution scaler (mod settings "Screen" / "Filter") places our own display;
+        // a Quad the user bound keeps the layout they gave it
+        if (quad == mDisplayQuad && Recomp_DisplayApply(quad, texture, (int)width, (int)height, 4.0f / 3.0f))
+        {
+            mFrameTexture = nullptr; // filter changed: a new texture next frame
+        }
     }
     texture->UpdatePixels(pixels, size_t(width) * size_t(height) * 4);
+    Ps1Provider::Get().SetFrame((int)width, (int)height);
+    Recomp_DisplayApplyWindow((int)width, (int)height);
 }
 
 // ---- HOME menu ------------------------------------------------------------------------------
@@ -733,16 +769,26 @@ uint32_t Ps1Player::ReadMenuButtons() const
     return bits;
 }
 
+// a HOME menu line, centred, `top` pixels from the middle of the screen
+static WeakPtr<Text> MakeHomeText(Node* parent, const char* name, float size, glm::vec4 color)
+{
+    Text* text = parent->CreateChild<Text>(name);
+    text->SetAnchorMode(AnchorMode::MidHorizontalStretch);
+    text->SetTextSize(size);
+    text->SetHorizontalJustification(Justification::Center);
+    text->SetVerticalJustification(Justification::Center);
+    text->SetColor(color);
+    return ResolveWeakPtr<Text>(text);
+}
+
+static void PlaceHomeText(Text* text, float top, float height)
+{
+    text->SetOffset(0.0f, top);
+    text->SetSize(1.0f, height);
+}
+
 void Ps1Player::BuildHomeMenu()
 {
-    mHomeActions = {HomeAction::Resume, HomeAction::Reset};
-#if PLATFORM_WII
-    mHomeActions.push_back(HomeAction::Exit);
-    mHomeActions.push_back(HomeAction::WiiMenu);
-#elif PLATFORM_DOLPHIN || !EDITOR
-    mHomeActions.push_back(HomeAction::Exit);
-#endif
-
     // Created after the display quad, so drawn over it.
     Quad* backdrop = CreateChild<Quad>("PS1 Home Backdrop");
     backdrop->SetAnchorMode(AnchorMode::FullStretch);
@@ -750,60 +796,102 @@ void Ps1Player::BuildHomeMenu()
     backdrop->SetColor(glm::vec4(0.0f, 0.0f, 0.0f, 0.8f));
     mHomeBackdrop = ResolveWeakPtr<Quad>(backdrop);
 
-    // Centred column, laid out in pixels around the middle of the screen.
-    const float titleHeight = 56.0f;
-    const float lineHeight = 44.0f;
-    const float hintHeight = 40.0f;
-    const float total = titleHeight + 16.0f + lineHeight * mHomeActions.size() + 16.0f + hintHeight;
-    float y = -total * 0.5f;
-
-    auto makeText = [this](const char* name, float top, float height, float size, glm::vec4 color) {
-        Text* text = CreateChild<Text>(name);
-        text->SetAnchorMode(AnchorMode::MidHorizontalStretch);
-        text->SetOffset(0.0f, top);
-        text->SetSize(1.0f, height);
-        text->SetTextSize(size);
-        text->SetHorizontalJustification(Justification::Center);
-        text->SetVerticalJustification(Justification::Center);
-        text->SetColor(color);
-        return ResolveWeakPtr<Text>(text);
-    };
-
-    mHomeTitle = makeText("PS1 Home Title", y, titleHeight, 34.0f, glm::vec4(1.0f));
-    if (Text* title = mHomeTitle.Get())
-    {
-        title->SetText(mGameTitle.empty() ? std::string("HOME Menu") : mGameTitle);
-    }
-    y += titleHeight + 16.0f;
-
-    mHomeItems.clear();
-    for (size_t i = 0; i < mHomeActions.size(); ++i)
-    {
-        mHomeItems.push_back(makeText("PS1 Home Item", y, lineHeight, 26.0f, glm::vec4(1.0f)));
-        y += lineHeight;
-    }
-    y += 16.0f;
-
+    mHomeTitle = MakeHomeText(this, "PS1 Home Title", 34.0f, glm::vec4(1.0f));
+    mHomeHint = MakeHomeText(this, "PS1 Home Hint", 18.0f, glm::vec4(0.7f, 0.7f, 0.7f, 1.0f));
 #if PLATFORM_DOLPHIN
     const char* hint = "A: select    B / HOME: back";
 #else
     const char* hint = "A / Enter: select    B / Home: back";
 #endif
-    mHomeHint = makeText("PS1 Home Hint", y, hintHeight, 18.0f, glm::vec4(0.7f, 0.7f, 0.7f, 1.0f));
     if (Text* text = mHomeHint.Get())
     {
         text->SetText(hint);
     }
 }
 
+// The entries for this opening (UIs come and go with scenes) and their layout: a
+// centred column in pixels around the middle of the screen.
+void Ps1Player::LayoutHomeMenu()
+{
+    mHomeEntries.clear();
+    mHomeEntries.push_back({HomeAction::Resume, {}});
+    for (Ps1MenuController* panel : Ps1MenuController::GetAll())
+    {
+        if (panel->IsInHomeMenu())
+        {
+            mHomeEntries.push_back({HomeAction::Panel, ResolveWeakPtr<Ps1MenuController>(panel)});
+        }
+    }
+    for (RecompMenuController* panel : RecompMenuController::GetAll())
+    {
+        if (panel->IsInHomeMenu())
+        {
+            HomeEntry entry{HomeAction::Panel, {}};
+            entry.recompPanel = ResolveWeakPtr<RecompMenuController>(panel);
+            mHomeEntries.push_back(entry);
+        }
+    }
+    mHomeEntries.push_back({HomeAction::Reset, {}});
+#if PLATFORM_WII
+    mHomeEntries.push_back({HomeAction::Exit, {}});
+    mHomeEntries.push_back({HomeAction::WiiMenu, {}});
+#elif PLATFORM_DOLPHIN || !EDITOR
+    mHomeEntries.push_back({HomeAction::Exit, {}});
+#endif
+
+    while (mHomeItems.size() < mHomeEntries.size())
+    {
+        mHomeItems.push_back(MakeHomeText(this, "PS1 Home Item", 26.0f, glm::vec4(1.0f)));
+    }
+
+    const float titleHeight = 56.0f;
+    const float lineHeight = 44.0f;
+    const float hintHeight = 40.0f;
+    const float total = titleHeight + 16.0f + lineHeight * mHomeEntries.size() + 16.0f + hintHeight;
+    float y = -total * 0.5f;
+
+    if (Text* title = mHomeTitle.Get())
+    {
+        PlaceHomeText(title, y, titleHeight);
+        title->SetText(mGameTitle.empty() ? std::string("HOME Menu") : mGameTitle);
+    }
+    y += titleHeight + 16.0f;
+    for (size_t i = 0; i < mHomeEntries.size(); ++i)
+    {
+        if (Text* item = mHomeItems[i].Get())
+        {
+            PlaceHomeText(item, y, lineHeight);
+        }
+        y += lineHeight;
+    }
+    y += 16.0f;
+    if (Text* hint = mHomeHint.Get())
+    {
+        PlaceHomeText(hint, y, hintHeight);
+    }
+}
+
 void Ps1Player::RefreshHomeMenu()
 {
-    for (size_t i = 0; i < mHomeItems.size(); ++i)
+    for (size_t i = 0; i < mHomeEntries.size() && i < mHomeItems.size(); ++i)
     {
         if (Text* text = mHomeItems[i].Get())
         {
+            const HomeEntry& entry = mHomeEntries[i];
+            std::string label;
+            if (entry.action == HomeAction::Panel)
+            {
+                Ps1MenuController* panel = entry.panel.Get();
+                RecompMenuController* recomp = entry.recompPanel.Get();
+                label = panel    ? (panel->IsOpen() ? "Hide " : "Show ") + panel->GetTitle()
+                        : recomp ? (recomp->IsOpen() ? "Hide " : "Show ") + recomp->GetTitle()
+                                 : "?";
+            }
+            else
+            {
+                label = HomeLabel((int)entry.action);
+            }
             const bool selected = (int)i == mHomeSelection;
-            const std::string label = HomeLabel((int)mHomeActions[i]);
             text->SetText(selected ? "> " + label + " <" : label);
             text->SetColor(selected ? glm::vec4(1.0f, 0.85f, 0.2f, 1.0f) : glm::vec4(1.0f));
         }
@@ -819,6 +907,7 @@ void Ps1Player::ShowHomeMenu(bool show)
     mHomeOpen = show;
     if (show)
     {
+        LayoutHomeMenu();
         mHomeSelection = 0;
         RefreshHomeMenu();
     }
@@ -831,17 +920,27 @@ void Ps1Player::ShowHomeMenu(bool show)
     if (Quad* backdrop = mHomeBackdrop.Get()) backdrop->SetVisible(show);
     if (Text* title = mHomeTitle.Get()) title->SetVisible(show);
     if (Text* hint = mHomeHint.Get()) hint->SetVisible(show);
-    for (WeakPtr<Text>& item : mHomeItems)
+    for (size_t i = 0; i < mHomeItems.size(); ++i)
     {
-        if (Text* text = item.Get()) text->SetVisible(show);
+        if (Text* text = mHomeItems[i].Get()) text->SetVisible(show && i < mHomeEntries.size());
     }
 }
 
-void Ps1Player::RunHomeAction(HomeAction action)
+void Ps1Player::RunHomeAction(const HomeEntry& entry)
 {
-    switch (action)
+    switch (entry.action)
     {
     case HomeAction::Resume:
+        break;
+    case HomeAction::Panel:
+        if (Ps1MenuController* panel = entry.panel.Get())
+        {
+            panel->Toggle(); // an interactive UI takes the gamepad until B closes it
+        }
+        else if (RecompMenuController* recomp = entry.recompPanel.Get())
+        {
+            recomp->Toggle();
+        }
         break;
     case HomeAction::Reset:
         LogDebug("Ps1Player: HOME menu: reset game");
@@ -880,7 +979,7 @@ bool Ps1Player::UpdateHomeMenu()
         return mHomeOpen;
     }
 
-    const int count = (int)mHomeActions.size();
+    const int count = (int)mHomeEntries.size();
     if (pressed & (MENU_OPEN | MENU_BACK))
     {
         ShowHomeMenu(false);
@@ -898,9 +997,9 @@ bool Ps1Player::UpdateHomeMenu()
     }
     if ((pressed & MENU_ACCEPT) && count > 0)
     {
-        const HomeAction action = mHomeActions[mHomeSelection];
+        const HomeEntry entry = mHomeEntries[mHomeSelection];
         ShowHomeMenu(false);
-        RunHomeAction(action);
+        RunHomeAction(entry);
     }
     return mHomeOpen;
 }
@@ -917,6 +1016,9 @@ void Ps1Player::Tick(float deltaTime)
 
     // HOME menu first: it pauses the game, and its Reset / Exit stop it.
     UpdateHomeMenu();
+
+    // mod settings: written to the game once it runs, kept, saved
+    ModSettings::Get().Tick(&Ps1Provider::Get());
 
     if (mInProcess)
     {
@@ -940,7 +1042,7 @@ void Ps1Player::Tick(float deltaTime)
         return;
     }
 
-    mShm->pad = mHomeOpen ? 0u : ReadPad();
+    mShm->pad = (mHomeOpen || Ps1Bind::IsInputBlocked()) ? 0u : ReadPad();
 
     const unsigned int serial = mShm->frame_serial;
     if (serial != mLastSerial)
@@ -975,6 +1077,9 @@ bool Ps1Player::StartGuest(const Ps1wModule* module)
 #endif
     LogDebug("Ps1Player: %s build%s of com.recomp.ps1, built %s %s", platform, hardware, __DATE__, __TIME__);
     mGameTitle = (module->title != nullptr) ? module->title : mGame;
+    Ps1Bind::SetInputBlocked(false); // a script's block from a previous play doesn't carry over
+    Recomp_SetInputBlocked(false);
+    Ps1Provider::Get().SetGame(module->package != nullptr ? module->package : mGame);
 
     std::string exePath, discPath, saveDir;
     ResolveGameDefaults(exePath, discPath, saveDir);
@@ -1069,7 +1174,14 @@ void Ps1Player::TickGuest(float deltaTime)
     }
 
     unsigned int pad = ReadPad();
-    if (mHoldPadUntilRelease)
+    if (Ps1Bind::IsInputBlocked())
+    {
+        // an open interactive UI (cheats menu) navigates with the gamepad: the game gets
+        // nothing, and not the press that closes it either
+        pad = 0;
+        mHoldPadUntilRelease = true;
+    }
+    else if (mHoldPadUntilRelease)
     {
         // the press that closed the menu (A / B) must not reach the game
         if (pad == 0)

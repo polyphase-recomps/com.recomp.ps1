@@ -318,10 +318,13 @@ static const int kXaF0[4] = {0, 60, 115, 98};
 static const int kXaF1[4] = {0, 0, -52, -55};
 
 /* Decodes one 2304-byte XA form-2 payload (4-bit) and pushes it resampled to 44100 Hz. */
+#define XA_OUT_FRAMES 9472
+
 static void decode_xa(XaState *st, const unsigned char *data, int stereo, int rate)
 {
     static short pcm[18 * 8 * 28];
-    static short out[4096 * 2];
+    /* one sector resampled to 44100 Hz: up to 4032 mono samples at 18900 Hz = 9408 frames */
+    static short out[XA_OUT_FRAMES * 2];
     int count = 0, g, u, s, outFrames = 0;
     double step = (double)rate / 44100.0;
 
@@ -354,7 +357,7 @@ static void decode_xa(XaState *st, const unsigned char *data, int stereo, int ra
     }
     count = stereo ? 18 * 4 * 28 : 18 * 8 * 28;
     /* resample by nearest-with-hold to 44100 Hz */
-    while (st->phase < count && outFrames < 4096)
+    while (st->phase < count && outFrames < XA_OUT_FRAMES)
     {
         int i = (int)st->phase;
 

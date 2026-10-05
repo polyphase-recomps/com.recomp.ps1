@@ -19,9 +19,9 @@ it lists what to install and how to set it up.
 
 | Path | |
 |---|---|
-| `Source/` | The addon: `Ps1Player` node, the in-engine game host, the script bridge (Lua `Ps1.*`), bridge-bound UI widgets, editor tools (Setup Dependencies, Tools > Recomp menus) |
+| `Source/` | The addon: `Ps1Player` node, the in-engine game host, the script bridge (Lua `Ps1.*`), bridge-bound UI widgets, editor tools (Tools > Recomp > <game> > Pre Process Rom, the UI builders) |
 | `Source/Wasm/` | wasm2c runtime and the host side of the GPU, disc and imports |
-| `Source/Guest/<game>/` | **Generated** by each game's Setup Dependencies (not in git) |
+| `Source/Guest/<game>/` | **Generated** by each game's Pre Process Rom (not in git) |
 | `Runtime/` | The PS1 replacement (`port/`), the game build (`cmake/Ps1Game.cmake`) and the tools |
 | `Docs/Modding.md` | Writing mods, patches, options, asset replacements and script-bridge APIs |
 

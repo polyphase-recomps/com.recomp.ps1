@@ -11,7 +11,7 @@ Function symbols are left out on purpose: those must be implemented natively,
 and the link error says which ones are missing (also written to
 missing_functions.txt for reference).
 
-Usage: gen_symbols.py <decomp_dir> <version> <out_dir>
+Usage: gen_symbols.py <decomp_dir> <version> <out_dir> [--ram-size=N]
 """
 import os
 import re
@@ -32,9 +32,12 @@ def code_ranges(config_dir):
             if not isinstance(seg, dict) or seg.get("type") != "code":
                 continue
             delta = seg["vram"] - seg["start"]
-            subs = seg.get("subsegments", [])
-            starts = [s[0] for s in subs if isinstance(s, list) and len(s) >= 2 and s[1] in ("c", "asm", "hasm")]
-            ends = [s[0] for s in subs if isinstance(s, list) and len(s) >= 2 and s[1] not in ("c", "asm", "hasm")]
+            subs = [s for s in seg.get("subsegments", []) if isinstance(s, list) and len(s) >= 2]
+            # code: c/asm and library objects' text ([start, o, name] or [start, o, name, .text])
+            def is_code(s):
+                return s[1] in ("c", "asm", "hasm") or (s[1] == "o" and (len(s) < 4 or s[3] == ".text"))
+            starts = [s[0] for s in subs if is_code(s)]
+            ends = [s[0] for s in subs if not is_code(s) and s[1] != "pad"]
             if starts:
                 end = min([e for e in ends if e > min(starts)] or [max(starts) + 0x100000])
                 ranges.append((min(starts) + delta, end + delta))
@@ -47,6 +50,8 @@ def overlay_starts(config_dir):
     for name in sorted(os.listdir(config_dir)):
         if not name.endswith(".yaml") or name in ("main.yaml", "bss.yaml", "sbss.yaml"):
             continue
+        if not re.match(r"^\w+\.yaml$", name):
+            continue  # not an overlay (e.g. a single-executable game's splat.<exe>.yaml)
         with open(os.path.join(config_dir, name)) as f:
             cfg = yaml.safe_load(f)
         segs = [s for s in cfg.get("segments", []) if isinstance(s, dict)]
@@ -59,7 +64,7 @@ def overlay_starts(config_dir):
     return starts
 
 
-RAM_BASE, RAM_SIZE = 0x80000000, 0x200000
+RAM_BASE, RAM_SIZE = 0x80000000, 0x200000  # RAM_SIZE: --ram-size (ps1_add_game RAM_SIZE)
 
 
 def write_wasm_symbols(data, path):
@@ -92,6 +97,10 @@ def write_wasm_symbols(data, path):
 
 
 def main():
+    global RAM_SIZE
+    for arg in sys.argv[4:]:
+        if arg.startswith("--ram-size="):
+            RAM_SIZE = int(arg.split("=", 1)[1], 0)
     decomp, version, out_dir = os.path.abspath(sys.argv[1]), sys.argv[2], sys.argv[3]
     config_dir = os.path.join(decomp, "config", version)
     ranges = code_ranges(config_dir)
@@ -101,7 +110,7 @@ def main():
             with open(os.path.join(config_dir, name)) as f:
                 for line in f:
                     m = re.match(r"\s*(\w+)\s*=\s*(0x[0-9A-Fa-f]+)\s*;(.*)", line)
-                    if m:
+                    if m and "ignore:true" not in m.group(3):
                         syms[m.group(1)] = (int(m.group(2), 16), "type:func" in m.group(3))
     data, funcs = {}, {}
     for sym, (addr, is_func) in syms.items():

@@ -101,18 +101,18 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Source\ComRecompPs1.cpp" />
-    <ClInclude Include="Source\Guest\dw\dw_guest-impl.h" Condition="Exists('Source\Guest\dw\dw_guest-impl.h')" />
-    <ClInclude Include="Source\Guest\dw\dw_guest.h" Condition="Exists('Source\Guest\dw\dw_guest.h')" />
-    <ClCompile Include="Source\Guest\dw\dw_guest_0.c" Condition="Exists('Source\Guest\dw\dw_guest_0.c')" />
-    <ClCompile Include="Source\Guest\dw\dw_guest_1.c" Condition="Exists('Source\Guest\dw\dw_guest_1.c')" />
-    <ClCompile Include="Source\Guest\dw\dw_guest_2.c" Condition="Exists('Source\Guest\dw\dw_guest_2.c')" />
-    <ClCompile Include="Source\Guest\dw\dw_guest_3.c" Condition="Exists('Source\Guest\dw\dw_guest_3.c')" />
-    <ClCompile Include="Source\Guest\dw\dw_guest_4.c" Condition="Exists('Source\Guest\dw\dw_guest_4.c')" />
-    <ClCompile Include="Source\Guest\dw\dw_guest_5.c" Condition="Exists('Source\Guest\dw\dw_guest_5.c')" />
-    <ClCompile Include="Source\Guest\dw\dw_guest_6.c" Condition="Exists('Source\Guest\dw\dw_guest_6.c')" />
-    <ClCompile Include="Source\Guest\dw\dw_guest_7.c" Condition="Exists('Source\Guest\dw\dw_guest_7.c')" />
-    <ClCompile Include="Source\Guest\dw\dw_guest_module.c" Condition="Exists('Source\Guest\dw\dw_guest_module.c')" />
-    <ClCompile Include="Source\Guest\dw\dw_guest_register.cpp" Condition="Exists('Source\Guest\dw\dw_guest_register.cpp')" />
+    <ClInclude Include="Source\Guest\dw\dw_guest-impl.h" />
+    <ClInclude Include="Source\Guest\dw\dw_guest.h" />
+    <ClCompile Include="Source\Guest\dw\dw_guest_0.c" />
+    <ClCompile Include="Source\Guest\dw\dw_guest_1.c" />
+    <ClCompile Include="Source\Guest\dw\dw_guest_2.c" />
+    <ClCompile Include="Source\Guest\dw\dw_guest_3.c" />
+    <ClCompile Include="Source\Guest\dw\dw_guest_4.c" />
+    <ClCompile Include="Source\Guest\dw\dw_guest_5.c" />
+    <ClCompile Include="Source\Guest\dw\dw_guest_6.c" />
+    <ClCompile Include="Source\Guest\dw\dw_guest_7.c" />
+    <ClCompile Include="Source\Guest\dw\dw_guest_module.c" />
+    <ClCompile Include="Source\Guest\dw\dw_guest_register.cpp" />
     <ClCompile Include="Source\Ps1Dependencies.cpp" />
     <ClInclude Include="Source\Ps1Dependencies.h" />
     <ClCompile Include="Source\Ps1GameUIs.cpp" />

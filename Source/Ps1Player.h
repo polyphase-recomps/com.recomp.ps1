@@ -63,20 +63,29 @@ private:
     void ResolveGameDefaults(std::string& exe, std::string& disc, std::string& saves) const;
 
     // HOME menu: Wii Remote / Classic HOME, GameCube Z+Start, keyboard Home. While it
-    // is open the game is paused (no vblanks, no pad). Items depend on the platform.
+    // is open the game is paused (no vblanks, no pad). Items depend on the platform,
+    // plus Show / Hide for every UI with a Ps1MenuController in the running game.
     enum class HomeAction
     {
         Resume,
         Reset,
         Exit,     // back to the loader (Homebrew Channel / Swiss) or quit the game
         WiiMenu,  // Wii System Menu
+        Panel,    // show / hide a UI (Ps1MenuController)
+    };
+    struct HomeEntry
+    {
+        HomeAction action;
+        WeakPtr<class Ps1MenuController> panel;
+        WeakPtr<class RecompMenuController> recompPanel; // com.recomp.mod.base menus (mod settings)
     };
     // Returns true while the menu is open.
     bool UpdateHomeMenu();
     void BuildHomeMenu();
+    void LayoutHomeMenu();
     void ShowHomeMenu(bool show);
     void RefreshHomeMenu();
-    void RunHomeAction(HomeAction action);
+    void RunHomeAction(const HomeEntry& entry);
     uint32_t ReadMenuButtons() const;
 
     static PolyphaseEngineAPI* sAPI;
@@ -109,8 +118,8 @@ private:
     WeakPtr<class Quad> mHomeBackdrop;
     WeakPtr<class Text> mHomeTitle;
     WeakPtr<class Text> mHomeHint;
-    std::vector<WeakPtr<class Text>> mHomeItems; // one per action
-    std::vector<HomeAction> mHomeActions;
+    std::vector<WeakPtr<class Text>> mHomeItems; // a pool; the first mHomeEntries.size() are shown
+    std::vector<HomeEntry> mHomeEntries;
     std::string mGameTitle;
     bool mHomeOpen = false;
     int mHomeSelection = 0;

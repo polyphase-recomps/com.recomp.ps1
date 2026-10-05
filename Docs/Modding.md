@@ -229,9 +229,13 @@ work today.
 
 ## 5. Building and testing
 
-- In the editor: packaging runs **Setup Dependencies** first (Packaging window →
-  Target Options → PS1 Recomp), which rebuilds the game with your patches and mod code.
-  Run it from there while iterating, then **Reload Native Addons**.
+- In the editor: **Tools → Recomp → <game> → Pre Process Rom** rebuilds the game with your
+  patches and mod code (packaging also runs it first; Packaging window → Target Options
+  → PS1 Recomp shows each game's state). Then restart the editor and reopen the project.
+  A new game package gets the menu by having a `"rom"` block in its `Assets/game.json`:
+  the `local.cmake` variable of the disc image (`variable`), a `description`, the boot
+  executable to look for on the disc (`id`), and optionally the decomp folder's variable
+  (`sourceVariable`, `sourceDescription`, and `sourceCheck`, a file it must contain).
 - From a terminal: `Native\build.ps1` (Windows exe) or
   `Native\build.ps1 -Guest wasm -Target ps1_addon` (what the editor uses).
 - Headless tests make mods easy to check without playing:
@@ -331,6 +335,9 @@ Ps1.Request(name, ...)          -- queues a request with integer arguments; id o
 Ps1.Result(id)                  -- result once the game ran it, else nil
 Ps1.Variables()                 -- { {name=, type=, count=, help=}, ... }
 Ps1.Requests()                  -- { {name=, help=}, ... }
+Ps1.SetInputBlocked(true)       -- the game gets no gamepad input (your own menu is open)
+Ps1.SetInputBlocked(false)      -- give it back
+Ps1.IsInputBlocked()            -- blocked by a script or an open interactive UI
 ```
 
 A button that warps and reports back:
@@ -358,7 +365,9 @@ text, so a debug panel can be generic.
 
 `com.recomp.ps1` adds widget types bound to the bridge: `Ps1Text` (format with
 `{variable}` tokens), `Ps1Toggle`, `Ps1Button` (request or step a variable) and
-`Ps1Bar`. Their bindings are inspector properties, so a UI made of them needs no
+`Ps1Bar`, plus `Ps1MenuController`, which shows / hides a UI, gives it the gamepad, and
+can follow a game variable (**Bound Variable**: a pause menu bound to the game's
+`paused`). Their bindings are inspector properties, so a UI made of them needs no
 script. See `Source/Ps1Widgets.h`; the Digimon World guide has the token syntax and the
 ready-made UIs (Tools > Recomp > Digimon), which are built from them by
 `Source/Ps1GameUIs.cpp`. A new game adds its own UI tools there.
@@ -370,3 +379,31 @@ Native code (other addons, nodes) uses the same functions directly, from
 `BridgeVariables()`, `BridgeRequests()`, `BridgeGet(name, index, value)`,
 `BridgeGetString(name, index, text)`, `BridgeRequest(name, args)` and
 `BridgeResult(id, result)`. Call them from the main thread.
+
+## Mod settings menu, `Recomp` / `Mods` Lua, resolution scaler
+
+The mod layer every recomp runtime shares is **com.recomp.mod.base** (a dependency of this
+package; see its README):
+
+- **Tools > Recomp > Mods > Mod Map Editor**: a Mod Map (asset) lists what players can
+  change or watch. **Import...** fills it from the running game, or without running
+  anything from the bridge tables in the game package's `Native/` sources.
+- **Tools > Recomp > Mods > Generate Mod Settings Scene...**: a gamepad settings menu built
+  from the map (tabs per group, Save / Reset / Close, Display page). Generating again
+  updates it and keeps your edits.
+- At runtime the player's choices are written to the game, kept ("lock" entries) and
+  saved (`Saves/<name>.mods`, GameCube memory card).
+- Lua `Recomp.*` works on any runtime; `Mods.*` reads and changes the settings.
+- The player node places its picture with the shared **resolution scaler**: Fit
+  (the console's real shape), Integer, Native, Full Screen, Scale ×N, sharp / smooth, and
+  window sizes on Windows.
+- **Tools > Recomp > Mods > Live Variables** shows and edits the running game's
+  variables: handy for finding cheats.
+
+On PS1 the provider is `Source/Ps1Provider.cpp`. Its entries can be:
+
+- bridge variables;
+- raw PS1 addresses (`0x80xxxxxx`, read little-endian from the guest);
+- requests;
+- startup options. A player's choice overrides the matching `game.json` `"options"` entry
+  the next time the game starts.

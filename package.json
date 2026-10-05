@@ -3,6 +3,9 @@
     "author": "",
     "description": "PS1 recompilation runtime: builds 100%-decompiled PS1 games natively and plays them with the Ps1Player node",
     "version": "1.0.0",
+    "dependencies": {
+        "com.recomp.mod.base": "https://github.com/polyphase-recomps/com.recomp.mod.base"
+    },
     "native": {
         "target": "engine",
         "sourceDir": "Source",

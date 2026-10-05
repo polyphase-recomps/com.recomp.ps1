@@ -22,6 +22,8 @@
 #include <cstdio>
 #include <functional>
 #include <string>
+#include <vector>
+#include <algorithm>
 
 namespace
 {
@@ -115,32 +117,77 @@ void Bar(Builder& b, Node* parent, const char* name, const char* variable, const
     });
 }
 
-void Toggle(Builder& b, Node* parent, const char* name, const char* label, const char* variable, float y)
+// A cheat switch: a Button (gamepad navigation reaches Buttons, not CheckBoxes) that
+// toggles the variable and shows its state, "Infinite HP: ON".
+Ps1Button* ToggleButton(Builder& b, Node* parent, const char* name, const char* label, const char* variable, float y)
 {
-    b.Ensure<Ps1Toggle>(parent, name, [&](Ps1Toggle* c) {
-        Place(c, 0.0f, y, 270.0f, kRow);
-        c->SetText(label);
-        c->SetVariable(variable, 1);
+    return b.Ensure<Ps1Button>(parent, name, [&](Ps1Button* btn) {
+        Place(btn, 0.0f, y, 272.0f, kRow + 2.0f);
+        btn->SetTextString(std::string(label) + ": --");
+        btn->SetToggle(variable, 1);
+        btn->SetLabelFormat(std::string(label) + ": {" + variable + "?ON|OFF}");
     });
 }
 
-void RequestButton(Builder& b, Node* parent, const char* name, const char* label, const char* request,
-                   const char* args, float x, float y, float w)
+Ps1Button* RequestButton(Builder& b, Node* parent, const char* name, const char* label, const char* request,
+                         const char* args, float x, float y, float w)
 {
-    b.Ensure<Ps1Button>(parent, name, [&](Ps1Button* btn) {
+    return b.Ensure<Ps1Button>(parent, name, [&](Ps1Button* btn) {
         Place(btn, x, y, w, 30.0f);
         btn->SetTextString(label);
         btn->SetRequest(request, args);
     });
 }
 
-void StepButton(Builder& b, Node* parent, const char* name, const char* label, const char* variable, int step,
-                float x, float y)
+Ps1Button* StepButton(Builder& b, Node* parent, const char* name, const char* label, const char* variable, int step,
+                      float x, float y)
 {
-    b.Ensure<Ps1Button>(parent, name, [&](Ps1Button* btn) {
+    return b.Ensure<Ps1Button>(parent, name, [&](Ps1Button* btn) {
         Place(btn, x, y, 36.0f, kRow + 2.0f);
         btn->SetTextString(label);
         btn->SetStep(variable, step, 1, 10);
+    });
+}
+
+// Gamepad navigation over rows of buttons: up / down to the same column of the next row
+// (or its last button), left / right within a row. Only links that are still empty are
+// set, so links the user changed stay. Missing buttons (nullptr) are skipped.
+void LinkNavigation(std::vector<std::vector<Button*>> rows)
+{
+    for (auto& row : rows)
+    {
+        row.erase(std::remove(row.begin(), row.end(), nullptr), row.end());
+    }
+    rows.erase(std::remove_if(rows.begin(), rows.end(), [](const std::vector<Button*>& r) { return r.empty(); }),
+               rows.end());
+    for (size_t r = 0; r < rows.size(); ++r)
+    {
+        for (size_t c = 0; c < rows[r].size(); ++c)
+        {
+            Button* btn = rows[r][c];
+            if (c > 0 && btn->GetNavLeft() == nullptr) btn->SetNavLeft(rows[r][c - 1]);
+            if (c + 1 < rows[r].size() && btn->GetNavRight() == nullptr) btn->SetNavRight(rows[r][c + 1]);
+            if (r > 0 && btn->GetNavUp() == nullptr)
+            {
+                const std::vector<Button*>& up = rows[r - 1];
+                btn->SetNavUp(up[c < up.size() ? c : up.size() - 1]);
+            }
+            if (r + 1 < rows.size() && btn->GetNavDown() == nullptr)
+            {
+                const std::vector<Button*>& down = rows[r + 1];
+                btn->SetNavDown(down[c < down.size() ? c : down.size() - 1]);
+            }
+        }
+    }
+}
+
+// Shows / hides the UI (HOME menu, or a gamepad button) and, for an interactive one,
+// gives it the gamepad while open.
+void Controller(Builder& b, Node* canvas, const char* title, bool startVisible, bool captureInput, Button* first)
+{
+    b.Ensure<Ps1MenuController>(canvas, "MenuController", [&](Ps1MenuController* c) {
+        Place(c, 0.0f, 0.0f, 0.0f, 0.0f);
+        c->Setup(title, startVisible, captureInput, first);
     });
 }
 
@@ -160,7 +207,9 @@ Canvas* RootCanvas(Builder& b, const char* name)
         if (existing != nullptr)
         {
             ++b.kept;
-            Canvas* canvas = existing->As<Canvas>();
+            // by name: As<Canvas>() needs Canvas::ClassRuntimeId, which some editor import
+            // libraries don't export
+            Canvas* canvas = existing->Is("Canvas") ? static_cast<Canvas*>(existing) : nullptr;
             if (canvas == nullptr)
             {
                 LogWarning("%s exists but is not a Canvas: left as it is", name);
@@ -239,6 +288,8 @@ void CreateDigimonStatsUI(void*)
         snprintf(format, sizeof(format), "{next_evo[%d]>digimon_name}    {next_evo_score[%d]}/4", i, i);
         Bound(b, evo, name, format, 0.0f, (2 + i) * kRow + 4.0f, 312.0f, kFontSize, kTextColor, true);
     }
+    // always shown; HOME menu > Hide Stats / Show Stats
+    Controller(b, canvas, "Stats", true, false, nullptr);
     Report(b, "Digimon Stats UI");
 }
 
@@ -257,13 +308,21 @@ void CreateDigimonCheatsUI(void*)
     Node* p = panel;
     Label(b, p, "Title", "Cheats", 14.0f, 8.0f, 272.0f, 22.0f, kHeaderColor);
 
+    std::vector<std::vector<Button*>> nav; // rows of buttons, for gamepad navigation
+
     Widget* toggles = Group(b, p, "Toggles", 14.0f, 42.0f, 272.0f, 6 * 30.0f);
-    Toggle(b, toggles, "InfiniteHP", "Infinite HP", "cheat_infhp", 0 * 30.0f);
-    Toggle(b, toggles, "AlwaysFull", "Always full", "cheat_full", 1 * 30.0f);
-    Toggle(b, toggles, "NoToilet", "Never needs the toilet", "cheat_nopoop", 2 * 30.0f);
-    Toggle(b, toggles, "NoPoopPenalty", "No poop penalty", "cheat_nopoopfine", 3 * 30.0f);
-    Toggle(b, toggles, "OneHitKO", "One hit KO", "cheat_ohko", 4 * 30.0f);
-    Toggle(b, toggles, "NeverMiss", "Never miss", "cheat_nevermiss", 5 * 30.0f);
+    const struct { const char* id; const char* label; const char* variable; } kToggles[] = {
+        {"InfiniteHP", "Infinite HP", "cheat_infhp"},
+        {"AlwaysFull", "Always full", "cheat_full"},
+        {"NoToilet", "Never needs the toilet", "cheat_nopoop"},
+        {"NoPoopPenalty", "No poop penalty", "cheat_nopoopfine"},
+        {"OneHitKO", "One hit KO", "cheat_ohko"},
+        {"NeverMiss", "Never miss", "cheat_nevermiss"},
+    };
+    for (int i = 0; i < 6; ++i)
+    {
+        nav.push_back({ToggleButton(b, toggles, kToggles[i].id, kToggles[i].label, kToggles[i].variable, i * 30.0f)});
+    }
 
     Widget* mults = Group(b, p, "Multipliers", 14.0f, 232.0f, 272.0f, 3 * 32.0f);
     const struct { const char* id; const char* format; const char* variable; } kMults[] = {
@@ -276,17 +335,64 @@ void CreateDigimonCheatsUI(void*)
         const float y = i * 32.0f;
         Widget* row = Group(b, mults, kMults[i].id, 0.0f, y, 272.0f, 30.0f);
         Bound(b, row, "Value", kMults[i].format, 0.0f, 2.0f, 180.0f);
-        StepButton(b, row, "Minus", "-", kMults[i].variable, -1, 190.0f, 0.0f);
-        StepButton(b, row, "Plus", "+", kMults[i].variable, 1, 232.0f, 0.0f);
+        nav.push_back({StepButton(b, row, "Minus", "-", kMults[i].variable, -1, 190.0f, 0.0f),
+                       StepButton(b, row, "Plus", "+", kMults[i].variable, 1, 232.0f, 0.0f)});
     }
 
     Widget* actions = Group(b, p, "Actions", 14.0f, 342.0f, 272.0f, 3 * 38.0f);
     Label(b, actions, "Header", "Actions", 0.0f, 0.0f, 272.0f, kFontSize, kHeaderColor);
-    RequestButton(b, actions, "Heal", "Heal", "heal", "", 0.0f, 28.0f, 131.0f);
-    RequestButton(b, actions, "AddBits", "+1000 bits", "add_money", "1000", 141.0f, 28.0f, 131.0f);
-    RequestButton(b, actions, "EvolveBest", "Evolve (best)", "evolve_good", "", 0.0f, 66.0f, 131.0f);
-    RequestButton(b, actions, "EvolveSukamon", "Evolve (Sukamon)", "evolve_bad", "", 141.0f, 66.0f, 131.0f);
+    nav.push_back({RequestButton(b, actions, "Heal", "Heal", "heal", "", 0.0f, 28.0f, 131.0f),
+                   RequestButton(b, actions, "AddBits", "+1000 bits", "add_money", "1000", 141.0f, 28.0f, 131.0f)});
+    nav.push_back({RequestButton(b, actions, "EvolveBest", "Evolve (best)", "evolve_good", "", 0.0f, 66.0f, 131.0f),
+                   RequestButton(b, actions, "EvolveSukamon", "Evolve (Sukamon)", "evolve_bad", "", 141.0f, 66.0f,
+                                 131.0f)});
+    LinkNavigation(nav);
+
+    // hidden until opened from the HOME menu (Show Cheats); takes the gamepad while open,
+    // B closes it
+    Button* first = nullptr;
+    for (const auto& row : nav)
+    {
+        for (Button* btn : row)
+        {
+            if (btn != nullptr && first == nullptr) first = btn;
+        }
+    }
+    Controller(b, canvas, "Cheats", false, true, first);
     Report(b, "Digimon Cheats UI");
+}
+
+// Start in the game pauses it (game.json option pausemenu=1) and sets the variable
+// "paused": this UI follows it. Resume / B / Start close it and resume the game.
+void CreateDigimonPauseUI(void*)
+{
+    Builder b;
+    Canvas* canvas = RootCanvas(b, "DigimonPauseUI");
+    Quad* panel = b.Ensure<Quad>(canvas, "Panel", [](Quad* q) {
+        // middle of the screen
+        q->SetAnchorMode(AnchorMode::Mid);
+        q->SetPosition(-130.0f, -90.0f);
+        q->SetDimensions(260.0f, 180.0f);
+        q->SetColor(kPanelColor);
+    });
+
+    Node* p = panel;
+    Label(b, p, "Title", "Paused", 14.0f, 8.0f, 232.0f, 22.0f, kHeaderColor);
+    Bound(b, p, "Where", "{map>map_name}    Day {day}  {hour:02}:{minute:02}", 14.0f, 36.0f, 232.0f, kFontSize,
+          kDimColor, true);
+
+    Widget* actions = Group(b, p, "Actions", 14.0f, 72.0f, 232.0f, 2 * 40.0f);
+    Button* resume = RequestButton(b, actions, "Resume", "Resume", "set paused", "0", 0.0f, 0.0f, 232.0f);
+    Button* save = RequestButton(b, actions, "SaveGame", "Save Game", "save", "", 0.0f, 40.0f, 232.0f);
+    LinkNavigation({{resume}, {save}});
+
+    b.Ensure<Ps1MenuController>(canvas, "MenuController", [&](Ps1MenuController* c) {
+        Place(c, 0.0f, 0.0f, 0.0f, 0.0f);
+        c->Setup("Pause", false, true, resume);
+        c->SetBoundVariable("paused");
+        c->SetInHomeMenu(false); // the game opens it, not the HOME menu
+    });
+    Report(b, "Digimon Pause UI");
 }
 }
 
@@ -301,6 +407,7 @@ void Ps1GameUIs::RegisterMenus(EditorUIHooks* hooks, uint64_t hookId)
     {
         hooks->AddMenuItem(hookId, "Tools", "Recomp/Digimon/Create Stats UI", CreateDigimonStatsUI, nullptr, nullptr);
         hooks->AddMenuItem(hookId, "Tools", "Recomp/Digimon/Create Cheats UI", CreateDigimonCheatsUI, nullptr, nullptr);
+        hooks->AddMenuItem(hookId, "Tools", "Recomp/Digimon/Create Pause UI", CreateDigimonPauseUI, nullptr, nullptr);
     }
 }
 

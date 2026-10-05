@@ -5,6 +5,8 @@
  */
 #include <port_host.h>
 
+/* wasi-libc's heap, not the game's (a game may map calloc to ps1_calloc, libc2.c) */
+#undef calloc
 void *calloc(unsigned long n, unsigned long size);
 
 void *port_alloc(unsigned long size)
