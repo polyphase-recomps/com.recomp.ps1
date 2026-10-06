@@ -4,6 +4,10 @@
 # rebuilt on every machine, and derived from the game.
 Source/Guest/
 
+# Recomp mode (Runtime/tools/recomp/build_recomp.ps1): each game recompiled from the
+# user's disc, as the library the addon links. Game code: never commit.
+/Lib/
+
 # --- Build output --------------------------------------------------------------------
 Runtime/build/
 

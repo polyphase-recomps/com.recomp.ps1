@@ -4,18 +4,23 @@
  *
  * CdRead2 with CdlModeStream starts the stream at the CdlSetloc position (libetc.c
  * calls port_cd_stream_*). Sectors "arrive" at the drive's speed (75 or 150 a second)
- * counted in vblanks; StGetNext reads what has arrived: video sectors are put
- * together into frames, XA audio sectors are decoded and queued for the mixer
- * (libsnd.c port_cd_audio_queue) unless the CD audio is muted. One frame is handed out
- * at a time, from a buffer of this file rather than the game's ring; StFreeRing
- * releases it. A game that spins on StGetNext waiting for the drive (as on the PS1)
- * waits a vblank every so often, so time passes and no CPU is burnt.
+ * counted in vblanks, and are read as they arrive, at every VSync (port_cd_stream_tick)
+ * and whenever the game asks for a frame: XA audio sectors are decoded and queued for
+ * the mixer (libsnd.c port_cd_audio_queue) unless the CD audio is muted, as the PS1's
+ * drive plays them on its own whatever the CPU does; video sectors are put together
+ * into frames. A finished frame waits for the game (StGetNext hands it out from a
+ * buffer of this file, StFreeRing releases it); one the game is too slow to take is
+ * replaced by the next, as the game's ring would overflow on the PS1, so a slow host
+ * drops movie frames instead of slowing the movie and breaking up its sound. A game
+ * that spins on StGetNext waiting for the drive waits a vblank every so often, so time
+ * passes and no CPU is burnt.
  */
 #include <port_host.h>
 
 #define RAW_SECTOR 2352
 #define VIDEO_PAYLOAD 2016
-#define MAX_FRAME (192 * 1024)
+#define MAX_FRAME (64 * 1024) /* LSD's biggest STR frame is 10 sectors (20 KB) */
+#define NUM_FRAMES 3          /* one being put together, one ready, one the game holds */
 #define POLLS_PER_VBLANK 32
 #define END_GAP 256 /* sectors without video before the stream reports its end */
 
@@ -39,11 +44,12 @@ static struct
     unsigned long consumed; /* sectors read since the start */
     int speed2x;
     unsigned long startFrame, endFrame;
-    /* the frame being put together / handed out */
-    unsigned char *frame;
-    unsigned long header[8];
+    /* frame buffers: `build` is being put together, `ready` waits for the game, `held`
+     * is the game's until StFreeRing (indexes, -1 = none) */
+    unsigned char *frame[NUM_FRAMES];
+    unsigned long header[NUM_FRAMES][8];
+    int build, ready, held;
     int number, chunks, have;
-    int ready, held;
     int gap;
     /* polling */
     unsigned lastPollVblank;
@@ -121,15 +127,35 @@ static void reset_frame(void)
 {
     sSt.number = -1;
     sSt.have = 0;
-    sSt.ready = 0;
-    sSt.held = 0;
+    sSt.build = 0;
+    sSt.ready = -1;
+    sSt.held = -1;
+}
+
+/* The frame being put together is complete: it waits for the game, replacing one the
+ * game hasn't taken. The next goes to a buffer neither waiting nor held. */
+static void finish_frame(void)
+{
+    int i;
+
+    sSt.ready = sSt.build;
+    for (i = 0; i < NUM_FRAMES; i++)
+    {
+        if (i != sSt.ready && i != sSt.held) break;
+    }
+    sSt.build = i;
+    sSt.number = -1;
+    sSt.have = 0;
 }
 
 void port_cd_stream_start(unsigned lba, int mode)
 {
     int i;
 
-    if (!sSt.frame) sSt.frame = (unsigned char *)port_alloc(MAX_FRAME);
+    for (i = 0; i < NUM_FRAMES; i++)
+    {
+        if (!sSt.frame[i]) sSt.frame[i] = (unsigned char *)port_alloc(MAX_FRAME);
+    }
     sSt.active = 1;
     sSt.lba = lba;
     sSt.startVblank = port_vblank_count();
@@ -169,13 +195,15 @@ static unsigned long arrived(void)
     return (unsigned long)elapsed * (sSt.speed2x ? 150 : 75) / 60 + 8;
 }
 
-/* Reads arrived sectors until a frame is complete. Returns 1 when one is ready. */
+/* Reads every sector that has arrived. Returns 1 when a frame is ready for the game. */
 static int pump(void)
 {
     static unsigned char sector[RAW_SECTOR];
-    unsigned long until = arrived();
+    unsigned long until;
 
-    while (!sSt.ready && sSt.consumed < until)
+    if (!sSt.active) return 0;
+    until = arrived();
+    while (sSt.consumed < until)
     {
         const unsigned char *sub, *data;
 
@@ -200,9 +228,9 @@ static int pump(void)
                 /* past the movie: report frame 0, which ends a player's stream */
                 int k;
 
-                for (k = 0; k < 8; k++) sSt.header[k] = 0;
-                for (k = 0; k < 64; k++) sSt.frame[k] = 0;
-                sSt.ready = 1;
+                for (k = 0; k < 8; k++) sSt.header[sSt.build][k] = 0;
+                for (k = 0; k < 64; k++) sSt.frame[sSt.build][k] = 0;
+                finish_frame();
                 sSt.gap = 0;
             }
             continue;
@@ -217,12 +245,12 @@ static int pump(void)
             {
                 sSt.number = number;
                 sSt.have = 0;
-                for (k = 0; k < 32; k++) ((unsigned char *)sSt.header)[k] = data[k];
+                for (k = 0; k < 32; k++) ((unsigned char *)sSt.header[sSt.build])[k] = data[k];
             }
             sSt.chunks = chunks;
             if ((unsigned long)(chunk + 1) * VIDEO_PAYLOAD <= MAX_FRAME)
             {
-                for (k = 0; k < VIDEO_PAYLOAD; k++) sSt.frame[chunk * VIDEO_PAYLOAD + k] = data[32 + k];
+                for (k = 0; k < VIDEO_PAYLOAD; k++) sSt.frame[sSt.build][chunk * VIDEO_PAYLOAD + k] = data[32 + k];
                 sSt.have++;
             }
             if (chunk == chunks - 1)
@@ -230,7 +258,7 @@ static int pump(void)
                 if (sSt.have == chunks && (unsigned long)number >= sSt.startFrame &&
                     (sSt.endFrame == 0xFFFFFFFFu || (unsigned long)number <= sSt.endFrame))
                 {
-                    sSt.ready = 1;
+                    finish_frame();
                 }
                 else
                 {
@@ -239,7 +267,14 @@ static int pump(void)
             }
         }
     }
-    return sSt.ready;
+    return sSt.ready >= 0;
+}
+
+/* VSync (libetc.c): the drive keeps reading, and its XA audio keeps playing, while the
+ * game is busy elsewhere. */
+void port_cd_stream_tick(void)
+{
+    pump();
 }
 
 /* ---- libcd streaming API ------------------------------------------------------------------- */
@@ -275,7 +310,7 @@ unsigned long StGetNext(unsigned long **addr, unsigned long **header)
 {
     unsigned now;
 
-    if (!sSt.active || sSt.held) return 1;
+    if (!sSt.active || sSt.held >= 0) return 1;
     if (!pump())
     {
         /* the drive has not delivered yet: a game spinning here lets time pass */
@@ -292,9 +327,10 @@ unsigned long StGetNext(unsigned long **addr, unsigned long **header)
         }
         if (!pump()) return 1;
     }
-    sSt.held = 1;
-    *addr = (unsigned long *)sSt.frame;
-    *header = sSt.header;
+    sSt.held = sSt.ready;
+    sSt.ready = -1;
+    *addr = (unsigned long *)sSt.frame[sSt.held];
+    *header = sSt.header[sSt.held];
     return 0;
 }
 
@@ -305,19 +341,13 @@ unsigned long StGetNextS(unsigned long **addr, unsigned long **header)
 
 unsigned long StFreeRing(unsigned long *base)
 {
-    if (sSt.held)
-    {
-        sSt.held = 0;
-        sSt.ready = 0;
-        sSt.number = -1;
-        sSt.have = 0;
-    }
+    sSt.held = -1;
     return 0;
 }
 
 void StRingStatus(short *free_sectors, short *over_sectors)
 {
-    if (free_sectors) *free_sectors = sSt.held ? 0 : 32;
+    if (free_sectors) *free_sectors = sSt.held >= 0 ? 0 : 32;
     if (over_sectors) *over_sectors = 0;
 }
 

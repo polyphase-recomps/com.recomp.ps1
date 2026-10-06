@@ -17,6 +17,11 @@ Runtime/
                          shared-memory mode for Ps1Player, headless test options
   tools/                 build_game.ps1, buildlog.ps1, check_addon.ps1, apply_patches.py,
                          sjis_sources.py, gen_symbols.py, ovl_launcher.py, extract_disc.py
+  cmake/Ps1Recomp.cmake  Recomp mode: ps1_recomp_game() (../Docs/Recomp.md)
+  recomp/                Recomp mode runtime: boot, code lookup, overlays, callbacks, GTE,
+                         setjmp, the live recompiler's loader (ps1_live.cpp)
+  tools/recomp/          ps1_syms.py, ps1_rom.py, gen_hle_wrappers.py, make_hle_symbols.py,
+                         build_recomp.ps1
 ```
 
 Modding (patches, mod code, options, assets, the Lua script bridge): see
@@ -163,7 +168,12 @@ package's `Assets/Bin/<name>.exe` (Windows only).
 - Standalone builds of the same guest: `-Guest wasm` also gives `build\wasm-<Config>\<name>.exe`,
   and `-Platform wii|gamecube` a libogc `.dol` (`Runtime/port/host/ogc`; disc and saves in
   `/ps1/` on the SD card, test options in `/ps1/<title>.args`). For Dolphin without SD
-  folder sync, `tools\make_sd_image.py` builds an `sd.raw`.
+  folder sync, `tools\make_sd_image.py` builds an `sd.raw`. A GameCube without the game
+  on an SD card (and Dolphin builds that can't emulate a GameCube SD adapter, such as
+  5.0-13178) reads `/ps1/` from the disc in the drive: `tools\make_gc_iso.py <out.iso>
+  <folder>` makes such a data disc (GameCube header + a file table the host reads as
+  `gcdisc:` + the same files as ISO9660); in Dolphin set it as the Default ISO and open
+  the .dol.
 - Decomp code that relies on MIPS behaviour the wasm build does not reproduce shows up as
   differences from the native build (compare frame dumps of both): e.g. `void` functions
   whose callers use the value left in `v0` need a patch (Digimon World: patch 0005).

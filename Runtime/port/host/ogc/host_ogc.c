@@ -2,12 +2,15 @@
  * Wii / GameCube platform host (libogc) for PS1 games on the com.recomp.ps1 runtime.
  * Used with the wasm2c guest backend (Source/Wasm).
  *
- * Files live on the SD card (Wii: front slot; GameCube: SD Gecko), on the default
- * libfat device:
+ * Files live on the SD card (Wii: front slot; GameCube: SD Gecko, SD2SP2 or GC Loader),
+ * on the default libfat device:
  *   /ps1/<game>/disc.idx + files the extracted disc (tools/extract_disc.py), or
  *   /ps1/<disc image>            the disc image named by the game package (raw .bin)
  *   /ps1/saves/<game>/card0/...  memory card files
  *   /ps1/<game>.log              log
+ * A GameCube without the game on an SD card reads /ps1/ from the disc in its drive
+ * instead (device gcdisc:, a disc made by tools/make_gc_iso.py; read-only, so no saves
+ * or log unless there is also an SD card).
  *
  * The game runs on its own thread and waits on the vblank the main thread signals.
  * Frames go to the screen through GX: RGB565 texture, 4:3 quad, copy to the XFB.
@@ -22,6 +25,7 @@
 #include <fat.h>
 #include <malloc.h>
 #include <dirent.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +34,9 @@
 #include <unistd.h>
 #ifdef HW_RVL
 #include <wiiuse/wpad.h>
+#else
+#include <fcntl.h>
+#include <sys/iosupport.h> /* gcdisc: (the drive: ogc/dvd.h) */
 #endif
 
 #include "port_host.h"
@@ -37,6 +44,12 @@
 #include "../host_backend.h"
 
 #define ROOT "/ps1/"
+/* Where the game's files are: ROOT on the SD card (Wii, or a GameCube SD adapter:
+ * SD Gecko, SD2SP2, GC Loader), else on GameCube the DVD drive's disc (an ISO9660
+ * image, tools/make_gc_iso.py), read-only. */
+static char sRoot[32] = ROOT;
+static int sReadOnly; /* no SD card: no log file, no saves */
+static char sStorageInfo[160]; /* what mount_storage found, for the error screen */
 #define GAME_STACK_SIZE (256u << 10) /* measured peak about 6 KB (the stats line reports it) */
 #define FIFO_SIZE (256 * 1024)
 
@@ -551,8 +564,12 @@ int port_trace_gpu(void)
 void port_debug_vram(const unsigned short *vram) {}
 
 /* ---- audio ----------------------------------------------------------------------------- */
-#define AUDIO_RING 16384 /* frames */
+#define AUDIO_RING 32768 /* frames: room for what a slow game makes up at once (libetc.c VSync) */
 #define AUDIO_BLOCK 1024 /* frames per ASND buffer */
+/* After the ring runs dry (the game fell behind), playing resumes once this much is
+ * queued: one longer gap instead of a click at every late burst. */
+#define AUDIO_PREFILL 4096
+static int sAudioPrimed;
 static s16 sRing[AUDIO_RING * 2];
 static volatile unsigned sRingWrite, sRingRead;
 static s16 sBlocks[3][AUDIO_BLOCK * 2] ATTRIBUTE_ALIGN(32);
@@ -580,11 +597,13 @@ static s16 *fill_block(void)
     int i;
 
     sBlockIndex = (sBlockIndex + 1) % 3;
+    if (!sAudioPrimed && sRingWrite - sRingRead >= AUDIO_PREFILL) sAudioPrimed = 1;
     for (i = 0; i < AUDIO_BLOCK; i++)
     {
         unsigned r = sRingRead;
 
-        if (r != sRingWrite)
+        if (sAudioPrimed && r == sRingWrite) sAudioPrimed = 0;
+        if (sAudioPrimed)
         {
             b[i * 2] = sRing[(r % AUDIO_RING) * 2];
             b[i * 2 + 1] = sRing[(r % AUDIO_RING) * 2 + 1];
@@ -730,6 +749,242 @@ static void *game_thread(void *arg)
     return NULL;
 }
 
+/* The game's files (an extracted disc or the image) under `root`? */
+static int game_files_at(const char *root)
+{
+    char path[256];
+    struct stat st;
+
+    snprintf(path, sizeof(path), "%s%s/disc.idx", root, PS1_GAME_TITLE);
+    if (stat(path, &st) == 0) return 1;
+    snprintf(path, sizeof(path), "%s%s", root, PS1_DEFAULT_DISC_NAME);
+    return stat(path, &st) == 0;
+}
+
+#ifndef HW_RVL
+/* ---- gcdisc: the game's files on the disc in the GameCube's drive -----------------------
+ * A disc made by tools/make_gc_iso.py: sector 8 holds "PS1FILES", then the sector and
+ * byte length of a file table and the file count (big-endian); the table lists each
+ * file's first sector, size and path. Read-only: open, read, seek, stat. */
+#define DISC_SECTOR 2048
+#define DISC_CACHE_SECTORS 16
+
+typedef struct
+{
+    u32 lba, size;
+    const char *name;
+} DiscFile;
+
+typedef struct
+{
+    const DiscFile *file;
+    u32 pos;
+} DiscHandle;
+
+static DiscFile *sDiscFiles;
+static u32 sDiscFileCount;
+static u8 *sDiscCache; /* DISC_CACHE_SECTORS sectors from sDiscCacheLba, 32-byte aligned */
+static u32 sDiscCacheLba = 0xFFFFFFFFu;
+
+/* Synchronous (libogc's __io_gcdvd.readSectors returned before the data had landed) */
+static int disc_read_sectors(u32 lba, u32 count, void *dst)
+{
+    static dvdcmdblk block;
+    s32 got;
+
+    DCInvalidateRange(dst, count * DISC_SECTOR);
+    got = DVD_ReadPrio(&block, dst, count * DISC_SECTOR, (s64)lba * DISC_SECTOR, 2);
+    return got == (s32)(count * DISC_SECTOR) ? 0 : -1;
+}
+
+static const DiscFile *disc_find(const char *path)
+{
+    u32 i;
+
+    if (strchr(path, ':')) path = strchr(path, ':') + 1;
+    while (*path == '/') path++;
+    for (i = 0; i < sDiscFileCount; i++)
+    {
+        if (strcasecmp(sDiscFiles[i].name, path) == 0) return &sDiscFiles[i];
+    }
+    return NULL;
+}
+
+static void disc_fill_stat(const DiscFile *f, struct stat *st)
+{
+    memset(st, 0, sizeof(*st));
+    st->st_mode = S_IFREG | 0444;
+    st->st_size = f->size;
+    st->st_blksize = DISC_SECTOR;
+    st->st_blocks = (f->size + 511) / 512;
+}
+
+static int disc_open(struct _reent *r, void *fileStruct, const char *path, int flags, int mode)
+{
+    DiscHandle *h = (DiscHandle *)fileStruct;
+    const DiscFile *f;
+
+    if ((flags & O_ACCMODE) != O_RDONLY)
+    {
+        r->_errno = EROFS;
+        return -1;
+    }
+    f = disc_find(path);
+    if (f == NULL)
+    {
+        r->_errno = ENOENT;
+        return -1;
+    }
+    h->file = f;
+    h->pos = 0;
+    return (int)h;
+}
+
+static int disc_close(struct _reent *r, void *fd)
+{
+    return 0;
+}
+
+static ssize_t disc_read(struct _reent *r, void *fd, char *ptr, size_t len)
+{
+    DiscHandle *h = (DiscHandle *)fd;
+    size_t done = 0;
+
+    if (h->pos >= h->file->size) return 0;
+    if (len > h->file->size - h->pos) len = h->file->size - h->pos;
+    while (done < len)
+    {
+        u32 abs = h->pos + (u32)done;
+        u32 lba = h->file->lba + abs / DISC_SECTOR;
+        u32 off = abs % DISC_SECTOR;
+        u32 chunk;
+
+        if (lba < sDiscCacheLba || lba >= sDiscCacheLba + DISC_CACHE_SECTORS)
+        {
+            if (disc_read_sectors(lba, DISC_CACHE_SECTORS, sDiscCache) != 0)
+            {
+                sDiscCacheLba = 0xFFFFFFFFu;
+                r->_errno = EIO;
+                return done ? (ssize_t)done : -1;
+            }
+            sDiscCacheLba = lba;
+        }
+        off += (lba - sDiscCacheLba) * DISC_SECTOR;
+        chunk = DISC_CACHE_SECTORS * DISC_SECTOR - off;
+        if (chunk > len - done) chunk = (u32)(len - done);
+        memcpy(ptr + done, sDiscCache + off, chunk);
+        done += chunk;
+    }
+    h->pos += (u32)done;
+    return (ssize_t)done;
+}
+
+static off_t disc_seek(struct _reent *r, void *fd, off_t pos, int dir)
+{
+    DiscHandle *h = (DiscHandle *)fd;
+    off_t base = dir == SEEK_CUR ? (off_t)h->pos : dir == SEEK_END ? (off_t)h->file->size : 0;
+
+    if (base + pos < 0)
+    {
+        r->_errno = EINVAL;
+        return -1;
+    }
+    h->pos = (u32)(base + pos);
+    return (off_t)h->pos;
+}
+
+static int disc_fstat(struct _reent *r, void *fd, struct stat *st)
+{
+    disc_fill_stat(((DiscHandle *)fd)->file, st);
+    return 0;
+}
+
+static int disc_stat(struct _reent *r, const char *path, struct stat *st)
+{
+    const DiscFile *f = disc_find(path);
+
+    if (f == NULL)
+    {
+        r->_errno = ENOENT;
+        return -1;
+    }
+    disc_fill_stat(f, st);
+    return 0;
+}
+
+static const devoptab_t sDiscDevoptab = {
+    .name = "gcdisc",
+    .structSize = sizeof(DiscHandle),
+    .open_r = disc_open,
+    .close_r = disc_close,
+    .read_r = disc_read,
+    .seek_r = disc_seek,
+    .fstat_r = disc_fstat,
+    .stat_r = disc_stat,
+};
+
+/* Reads the disc's file table and adds the gcdisc: device. 0 without such a disc. */
+static int disc_mount(void)
+{
+    u8 *hdr;
+    u32 table_lba, table_bytes, count, sectors, i, pos;
+    u8 *table;
+
+    DVD_Init();
+    if (DVD_Mount() < 0) return 0;
+    sDiscCache = (u8 *)memalign(32, DISC_CACHE_SECTORS * DISC_SECTOR);
+    hdr = sDiscCache;
+    if (hdr == NULL || disc_read_sectors(8, 1, hdr) != 0 || memcmp(hdr, "PS1FILES", 8) != 0) return 0;
+    table_lba = ((u32 *)hdr)[2];
+    table_bytes = ((u32 *)hdr)[3];
+    count = ((u32 *)hdr)[4];
+    sectors = (table_bytes + DISC_SECTOR - 1) / DISC_SECTOR;
+    table = (u8 *)memalign(32, sectors * DISC_SECTOR);
+    sDiscFiles = (DiscFile *)malloc(count * sizeof(DiscFile));
+    if (table == NULL || sDiscFiles == NULL || disc_read_sectors(table_lba, sectors, table) != 0) return 0;
+    for (i = 0, pos = 0; i < count && pos + 10 <= table_bytes; i++)
+    {
+        u16 len = (u16)((table[pos + 8] << 8) | table[pos + 9]);
+        char *name = (char *)malloc(len + 1);
+
+        sDiscFiles[i].lba = ((u32)table[pos] << 24) | (table[pos + 1] << 16) | (table[pos + 2] << 8) | table[pos + 3];
+        sDiscFiles[i].size =
+            ((u32)table[pos + 4] << 24) | (table[pos + 5] << 16) | (table[pos + 6] << 8) | table[pos + 7];
+        memcpy(name, table + pos + 10, len);
+        name[len] = 0;
+        sDiscFiles[i].name = name;
+        pos += 10u + len;
+    }
+    sDiscFileCount = i;
+    free(table);
+    return AddDevice(&sDiscDevoptab) >= 0;
+}
+#endif
+
+/* The SD card, else (GameCube) the disc in the drive. 0 when there is neither. */
+static int mount_storage(void)
+{
+    int sd = fatInitDefault();
+
+    sReadOnly = !sd;
+    if (sd && game_files_at(ROOT)) return 1;
+#ifndef HW_RVL
+    {
+        int disc = disc_mount();
+
+        snprintf(sStorageInfo, sizeof(sStorageInfo), "(SD card %s; disc %s)", sd ? "found" : "not found",
+                 disc ? "without the game's files" : "not found or not made by make_gc_iso.py");
+        if (disc && game_files_at("gcdisc:" ROOT))
+        {
+            /* logs and saves still go to the SD card when there is one */
+            snprintf(sRoot, sizeof(sRoot), "gcdisc:" ROOT);
+            return 1;
+        }
+    }
+#endif
+    return sd; /* an SD card without the game: "cannot open" follows */
+}
+
 int main(int argc, char **argv)
 {
     char path[256];
@@ -746,28 +1001,42 @@ int main(int argc, char **argv)
     LWP_MutexInit(&sVblankLock, false);
     LWP_CondInit(&sVblankCond);
 
-    if (!fatInitDefault())
+    if (!mount_storage())
     {
+#ifdef HW_RVL
         show_text_screen("No SD card: put the disc image in /ps1/ on the SD card.");
+#else
+        static char msg[300];
+
+        snprintf(msg, sizeof(msg),
+                 "No game files: put them in /ps1/ on the SD card (SD Gecko, SD2SP2) or on a disc made by "
+                 "make_gc_iso.py.\n%s",
+                 sStorageInfo);
+        show_text_screen(msg);
+#endif
         sCrashed = 1;
     }
     else
     {
-        mkdir(ROOT, 0777);
-        snprintf(path, sizeof(path), ROOT "%s.log", PS1_GAME_TITLE);
-        sLog = fopen(path, "w");
+        if (!sReadOnly)
+        {
+            mkdir(ROOT, 0777);
+            snprintf(path, sizeof(path), ROOT "%s.log", PS1_GAME_TITLE);
+            sLog = fopen(path, "w");
+        }
         snprintf(sSaveDir, sizeof(sSaveDir), ROOT "saves/%s/", PS1_GAME_TITLE);
-        snprintf(path, sizeof(path), ROOT "%s.args", PS1_GAME_TITLE);
+        snprintf(path, sizeof(path), "%s%s.args", sRoot, PS1_GAME_TITLE);
         load_args(path);
+        host_log("game files in %s%s", sRoot, sReadOnly ? " (read-only: no saves)" : "");
         /* an extracted disc (/ps1/<title>/disc.idx, from extract_disc.py) or the image */
-        snprintf(path, sizeof(path), ROOT "%s/disc.idx", PS1_GAME_TITLE);
+        snprintf(path, sizeof(path), "%s%s/disc.idx", sRoot, PS1_GAME_TITLE);
         if (!ps1w_disc_open(path))
         {
-            snprintf(path, sizeof(path), ROOT "%s", PS1_DEFAULT_DISC_NAME);
+            snprintf(path, sizeof(path), "%s%s", sRoot, PS1_DEFAULT_DISC_NAME);
         }
         if (!ps1w_disc_open(path))
         {
-            host_log("cannot open " ROOT "%s/ or %s", PS1_GAME_TITLE, path);
+            host_log("cannot open %s%s/ or %s", sRoot, PS1_GAME_TITLE, path);
             sCrashed = 1;
         }
         else if (!ps1_backend_init())

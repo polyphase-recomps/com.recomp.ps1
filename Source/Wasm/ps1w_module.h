@@ -25,12 +25,18 @@ typedef struct Ps1wModule
     void (*free)(void);
     void (*run)(void); /* boot + main(); returns if main returns */
     wasm_rt_memory_t *(*memory)(void);
+    /* Recomp (live) builds (Runtime/recomp): the folder with the game's recompiler data
+     * (syms.toml, game.json), set before run(); NULL in other builds. */
+    void (*set_data_dir)(const char *dir);
 } Ps1wModule;
 
 /* registry (ps1w_backend.c) */
 void ps1w_register_module(const Ps1wModule *module);
 /* by package id; NULL or "" gives the first registered game */
 const Ps1wModule *ps1w_find_module(const char *package);
+/* every registered game: index 0 .. count - 1 */
+int ps1w_module_count(void);
+const Ps1wModule *ps1w_module_at(int index);
 
 /* one game instance at a time (ps1w_backend.c) */
 int ps1w_instantiate(const Ps1wModule *module);

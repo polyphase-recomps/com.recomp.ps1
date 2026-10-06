@@ -29,3 +29,18 @@ void ps1w_bad_indirect_call(uint32_t index);
 #undef CHECK_CALL_INDIRECT
 #define CHECK_CALL_INDIRECT(table, ft, x) \
   (LIKELY((x) < table.size && table.data[x].func) || (ps1w_bad_indirect_call(x), 0))
+
+/* the module instance of a table slot, NULL past the table (tools/wasm_to_c.py) */
+#define PS1W_FUNCREF_INSTANCE(table, x) ((x) < (table).size ? (table).data[x].module_instance : (void *)0)
+
+/* Recomp mode (Runtime/cmake/Ps1Recomp.cmake): the PsyQ libraries are this module and the
+ * game is recompiled code, so a function pointer the game hands to a library (VSyncCallback,
+ * DecDCToutCallback ...) is a PS1 code address, not a table slot. Such a call runs the
+ * recompiled function at that address (Runtime/recomp/recomp_ps1.c). */
+#ifdef PS1W_RECOMP
+void *ps1w_guest_callback(uint32_t address);
+#undef CALL_INDIRECT
+#define CALL_INDIRECT(table, t, ft, x, ...)                                              \
+  ((LIKELY((x) < table.size && table.data[x].func)) ? ((t)table.data[x].func)(__VA_ARGS__) \
+                                                     : ((t)ps1w_guest_callback(x))(__VA_ARGS__))
+#endif

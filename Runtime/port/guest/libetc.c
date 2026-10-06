@@ -21,6 +21,8 @@ void StopCallback(void) {}
 void PadInit(int mode) {}
 void PadStop(void) {}
 
+#define AUDIO_CATCH_UP 22050 /* stereo frames at 44100 Hz */
+
 long VSync(int mode)
 {
     unsigned now, target;
@@ -49,11 +51,13 @@ long VSync(int mode)
     cd_vsync();
     if (sVSyncCallback) sVSyncCallback();
     {
-        /* audio follows the video clock: 735 samples per 60 Hz frame */
+        /* audio follows the video clock: 735 samples per 60 Hz frame. A game slower than
+         * the clock (a slow host) gets the samples it owes made up, up to half a second;
+         * beyond that (a stall, a load) the clock is followed from here. */
         static unsigned long long produced;
         unsigned long long target = (unsigned long long)sLastVsync * 735;
 
-        if (produced + 4096 < target || produced > target) produced = target - 735;
+        if (produced + AUDIO_CATCH_UP < target || produced > target) produced = target - 735;
         static int sNoSound = -1;
 
         if (sNoSound < 0)
@@ -63,10 +67,13 @@ long VSync(int mode)
 
             sNoSound = port_debug_values("nosnd", v, 1) == 1 && v[0];
         }
-        if (target > produced)
+        while (target > produced)
         {
-            if (!sNoSound) port_snd_render((int)(target - produced));
-            produced = target;
+            /* port_snd_render makes at most 4096 at a time */
+            int frames = target - produced > 4096 ? 4096 : (int)(target - produced);
+
+            if (!sNoSound) port_snd_render(frames);
+            produced += (unsigned long long)frames;
         }
     }
     return 0;
@@ -121,6 +128,7 @@ static int sSyncPending;
 /* libcd_stream.c */
 void port_cd_stream_start(unsigned lba, int mode);
 void port_cd_stream_stop(void);
+void port_cd_stream_tick(void);
 void port_cd_set_mute(int muted);
 void port_cd_set_filter(int on, int file, int chan);
 static unsigned char sFilter[2];
@@ -192,6 +200,8 @@ int CdControl(unsigned char com, unsigned char *param, unsigned char *result)
 /* Called from VSync: delivers a pending CdSyncCallback. */
 static void cd_vsync(void)
 {
+    /* a CD stream keeps reading (and playing its XA audio) while the game is busy */
+    port_cd_stream_tick();
     if (sSyncPending && sSyncCallback)
     {
         static unsigned char result[8] = {0x02};

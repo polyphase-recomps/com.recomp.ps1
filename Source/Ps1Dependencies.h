@@ -14,6 +14,12 @@
  * The setup also runs before packaging (pre-build hook; a failure cancels the build)
  * unless the build profile turns it off in its Target Options, which show each game's
  * state and open the modal.
+ *
+ * Build mode (Target Options, kModeOption): Decomp is the above. Recomp and Recomp (live)
+ * build a game package's Recomp/ folder instead (Windows x64): the game recompiled from the
+ * disc by N64Recomp, or LiveRecomp recompiling it when it boots, published as a library and
+ * Source/Guest/<name>_recomp (Runtime/tools/recomp/build_recomp.ps1). A package with only
+ * Recomp/ (no decomp) is a game package too.
  */
 #pragma once
 
@@ -26,6 +32,11 @@ namespace Ps1Dependencies
 {
 // Build profile option (Target Options): "1" (default) runs the setup before packaging.
 constexpr const char* kSetupOption = "ps1.setupDependencies";
+// Build profile option (Target Options): "auto" (default), "decomp", "recomp" or "live".
+constexpr const char* kModeOption = "ps1.buildMode";
+
+// The Build mode the next setup uses (the pre-build hook passes the profile's).
+void SetBuildMode(const char* mode);
 
 // Sets up every game package now, logging the output. False if one failed.
 bool SetupAll();

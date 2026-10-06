@@ -1,0 +1,614 @@
+diff --git a/ThirdParty/N64Recomp/LiveRecomp/live_generator.cpp b/ThirdParty/N64Recomp/LiveRecomp/live_generator.cpp
+index 61e1ff5..eba5b3e 100644
+--- a/ThirdParty/N64Recomp/LiveRecomp/live_generator.cpp
++++ b/ThirdParty/N64Recomp/LiveRecomp/live_generator.cpp
+@@ -71,6 +71,7 @@ struct N64Recomp::LiveGeneratorContext {
+ };
+ 
+ N64Recomp::LiveGenerator::LiveGenerator(size_t num_funcs, const LiveGeneratorInputs& inputs) : inputs(inputs) {
++    rdram_offset = inputs.ps1 ? 0 : sljit_sw(::rdram_offset);
+     compiler = sljit_create_compiler(nullptr);
+     context = std::make_unique<LiveGeneratorContext>();
+     context->func_labels.resize(num_funcs);
+@@ -527,6 +528,11 @@ void N64Recomp::LiveGenerator::process_binary_op(const BinaryOp& op, const Instr
+         // Add the base and immediate into the arithemtic temp.
+         sljit_emit_op2(compiler, SLJIT_ADD, Registers::arithmetic_temp1, 0, src1, src1w, src2, src2w);
+ 
++        if (inputs.ps1) {
++            // com.recomp.ps1: little-endian, folded addresses
++            address_xor = 0;
++            ps1_fold(Registers::arithmetic_temp1, Registers::arithmetic_temp2);
++        }
+         if (address_xor != 0) {
+             // xor the address with the specified amount
+             sljit_emit_op2(compiler, SLJIT_XOR, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp1, 0, SLJIT_IMM, address_xor);
+@@ -591,6 +597,10 @@ void N64Recomp::LiveGenerator::process_binary_op(const BinaryOp& op, const Instr
+         // addr = addr & ~(word_size - 1);
+         sljit_emit_op2(compiler, SLJIT_AND, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp1, 0, SLJIT_IMM, ~(word_size - 1));
+ 
++        if (inputs.ps1) {
++            ps1_fold(Registers::arithmetic_temp1, Registers::arithmetic_temp3);
++        }
++
+         // Load the word at rdram + aligned address into the temp1 with sign-extension.
+         // loaded_value = *addr
+         if (doubleword) {
+@@ -602,8 +612,8 @@ void N64Recomp::LiveGenerator::process_binary_op(const BinaryOp& op, const Instr
+             sljit_emit_op1(compiler, SLJIT_MOV_S32, Registers::arithmetic_temp1, 0, SLJIT_MEM2(Registers::rdram, Registers::arithmetic_temp1), 0);
+         }
+ 
+-        // Inverse the misalignment if this is a right load.
+-        if (!left) {
++        // Inverse the misalignment if this is a right load (com.recomp.ps1, little-endian: a left one).
++        if (left == inputs.ps1) {
+             // misalignment = (word_size - 1 - misalignment) * 8
+             sljit_emit_op2(compiler, SLJIT_SUB, Registers::arithmetic_temp2, 0, SLJIT_IMM, word_size - 1, Registers::arithmetic_temp2, 0);
+         }
+@@ -1208,6 +1218,9 @@ void N64Recomp::LiveGenerator::process_store_op(const StoreOp& op, const Instruc
+         // Mask the address with ~alignment_mask to get the aligned address and put it in temp1.
+         // addr = addr & ~(word_size - 1);
+         sljit_emit_op2(compiler, SLJIT_AND, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp1, 0, SLJIT_IMM, ~(word_size - 1));
++        if (inputs.ps1) {
++            ps1_fold(Registers::arithmetic_temp1, Registers::arithmetic_temp4);
++        }
+ 
+         // Load the word at rdram + aligned address into the temp1 with sign-extension.
+         // loaded_value = *addr
+@@ -1220,8 +1233,8 @@ void N64Recomp::LiveGenerator::process_store_op(const StoreOp& op, const Instruc
+             sljit_emit_op1(compiler, SLJIT_MOV_S32, Registers::arithmetic_temp3, 0, SLJIT_MEM2(Registers::rdram, Registers::arithmetic_temp1), 0);
+         }
+ 
+-        // Inverse the misalignment if this is a right load.
+-        if (!left) {
++        // Inverse the misalignment if this is a right load (com.recomp.ps1, little-endian: a left one).
++        if (left == inputs.ps1) {
+             // misalignment = (word_size - 1 - misalignment) * 8
+             sljit_emit_op2(compiler, SLJIT_SUB, Registers::arithmetic_temp2, 0, SLJIT_IMM, word_size - 1, Registers::arithmetic_temp2, 0);
+         }
+@@ -1265,6 +1278,15 @@ void N64Recomp::LiveGenerator::process_store_op(const StoreOp& op, const Instruc
+         }
+     };
+ 
++    if (inputs.ps1 && (op.type == StoreOpType::SW || op.type == StoreOpType::SWC1 || op.type == StoreOpType::SH ||
++                       op.type == StoreOpType::SB)) {
++        // com.recomp.ps1: little-endian, folded addresses
++        ps1_fold(Registers::arithmetic_temp1, Registers::arithmetic_temp3);
++        sljit_s32 mov = op.type == StoreOpType::SH ? SLJIT_MOV_U16 : op.type == StoreOpType::SB ? SLJIT_MOV_U8 : SLJIT_MOV_U32;
++        sljit_emit_op1(compiler, mov, SLJIT_MEM2(Registers::rdram, Registers::arithmetic_temp1), 0, src, srcw);
++        return;
++    }
++
+     switch (op.type) {
+         case StoreOpType::SD:
+         case StoreOpType::SDC1:        
+@@ -1427,10 +1449,35 @@ void N64Recomp::LiveGenerator::emit_function_call_reference_symbol(const Context
+     }
+ }
+ 
+-void N64Recomp::LiveGenerator::emit_function_call(const Context&, size_t function_index) const {
++void N64Recomp::LiveGenerator::emit_function_call(const Context& recomp_context, size_t function_index) const {
++    // com.recomp.ps1: setjmp returns twice, so the C runtime's _setjmp is called right here
++    // (a null frame: longjmp then restores registers without unwinding through this code)
++    if (inputs.ps1 && recomp_context.functions[function_index].name == "setjmp_recomp") {
++        sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
++        sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
++        sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2(P, P, P), SLJIT_IMM, sljit_sw(inputs.ps1_setjmp_begin));
++        sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM, 0);
++        sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2(32, P, P), SLJIT_IMM, sljit_sw(inputs.ps1_setjmp_fn));
++        sljit_jump* first = sljit_emit_cmp(compiler, SLJIT_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, 0);
++        sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R2, 0, SLJIT_R0, 0);
++        sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
++        sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
++        sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32), SLJIT_IMM, sljit_sw(inputs.ps1_setjmp_resume));
++        sljit_jump* done = sljit_emit_jump(compiler, SLJIT_JUMP);
++        sljit_set_label(first, sljit_emit_label(compiler));
++        sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(2), SLJIT_IMM, 0);
++        sljit_set_label(done, sljit_emit_label(compiler));
++        return;
++    }
+     // Load rdram and ctx into R0 and R1.
+     sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
+     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
++    // com.recomp.n64: a function the host implements (no recompiled body): call it directly.
++    auto external_it = inputs.external_functions.find(function_index);
++    if (external_it != inputs.external_functions.end()) {
++        sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P), SLJIT_IMM, sljit_sw(external_it->second));
++        return;
++    }
+     // Call the function and save the jump to set its label later on.
+     sljit_jump* call_jump = sljit_emit_call(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P));
+     context->inner_calls.emplace_back(InnerCall{ .target_func_index = function_index, .jump = call_jump });
+@@ -1443,9 +1490,24 @@ void N64Recomp::LiveGenerator::emit_named_function_call(const std::string& funct
+ }
+ 
+ void N64Recomp::LiveGenerator::emit_goto(const std::string& target) const {
+-    sljit_jump* jump = sljit_emit_jump(compiler, SLJIT_JUMP);
+     // Check if the label already exists.
+     auto find_it = context->labels.find(target);
++    // com.recomp.n64: a jump to a label already placed is a loop's back edge. Count it against the
++    // host's loop budget, and let the host preempt the loop when that runs out.
++    if (find_it != context->labels.end() && inputs.loop_budget != nullptr && inputs.loop_preempt != nullptr) {
++        sljit_emit_op1(compiler, SLJIT_MOV_S32, SLJIT_R0, 0, SLJIT_MEM0(), sljit_sw(inputs.loop_budget));
++        sljit_emit_op2(compiler, SLJIT_SUB32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, 1);
++        sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_MEM0(), sljit_sw(inputs.loop_budget), SLJIT_R0, 0);
++        sljit_jump* in_budget = sljit_emit_cmp(compiler, SLJIT_SIG_GREATER_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, 0);
++        sljit_set_label(in_budget, find_it->second);
++        // labels are named L_<vram>
++        uint32_t loop_vram = (target.size() > 2) ? (uint32_t)std::stoul(target.substr(2), nullptr, 16) : 0;
++        sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
++        sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
++        sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R2, 0, SLJIT_IMM, (sljit_s32)loop_vram);
++        sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32), SLJIT_IMM, sljit_sw(inputs.loop_preempt));
++    }
++    sljit_jump* jump = sljit_emit_jump(compiler, SLJIT_JUMP);
+     if (find_it != context->labels.end()) {
+         sljit_set_label(jump, find_it->second);
+     }
+@@ -1978,3 +2040,96 @@ N64Recomp::ShimFunction::~ShimFunction() {
+     code = nullptr;
+     func = nullptr;
+ }
++
++// ---- com.recomp.ps1 ---------------------------------------------------------------------------
++// addr = (addr & 0x7FFFFF) | (bit 28 of addr ? 0x7F0000 : 0) (Source/Wasm/ps1w.h PS1W_OFFSET)
++void N64Recomp::LiveGenerator::ps1_fold(int reg, int scratch) const {
++    sljit_emit_op2(compiler, SLJIT_LSHR32, scratch, 0, reg, 0, SLJIT_IMM, 28);
++    sljit_emit_op2(compiler, SLJIT_AND, scratch, 0, scratch, 0, SLJIT_IMM, 1);
++    sljit_emit_op2(compiler, SLJIT_SUB, scratch, 0, SLJIT_IMM, 0, scratch, 0);
++    sljit_emit_op2(compiler, SLJIT_AND, scratch, 0, scratch, 0, SLJIT_IMM, 0x7F0000);
++    sljit_emit_op2(compiler, SLJIT_AND, reg, 0, reg, 0, SLJIT_IMM, 0x7FFFFF);
++    sljit_emit_op2(compiler, SLJIT_OR, reg, 0, reg, 0, scratch, 0);
++}
++
++bool N64Recomp::LiveGenerator::emit_ps1_gte_command(uint32_t raw) const {
++    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R0, 0, Registers::ctx, 0);
++    sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, (sljit_s32)raw);
++    sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, 32), SLJIT_IMM, sljit_sw(inputs.ps1_gte_command));
++    return true;
++}
++
++bool N64Recomp::LiveGenerator::emit_ps1_cop2_move(bool to_gpr, bool control, int gpr, int cop2_reg) const {
++    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R0, 0, Registers::ctx, 0);
++    sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, cop2_reg);
++    if (to_gpr) {
++        sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2(32, P, 32), SLJIT_IMM,
++                         sljit_sw(control ? inputs.ps1_gte_read_ctrl : inputs.ps1_gte_read_data));
++        if (gpr != 0) {
++            sljit_emit_op1(compiler, SLJIT_MOV_S32, SLJIT_R0, 0, SLJIT_R0, 0);
++            sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(gpr), SLJIT_R0, 0);
++        }
++    }
++    else {
++        sljit_sw src, srcw;
++        get_gpr_values(gpr, src, srcw);
++        sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R2, 0, src, srcw);
++        sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS3V(P, 32, 32), SLJIT_IMM,
++                         sljit_sw(control ? inputs.ps1_gte_write_ctrl : inputs.ps1_gte_write_data));
++    }
++    return true;
++}
++
++bool N64Recomp::LiveGenerator::emit_ps1_cop2_memory(bool store, int cop2_reg, int base, int16_t imm) const {
++    // address = base + imm, folded, in R3 (kept across the call in a saved register would be
++    // better; the call is rare enough to reload)
++    if (store) {
++        sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R0, 0, Registers::ctx, 0);
++        sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, cop2_reg);
++        sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2(32, P, 32), SLJIT_IMM, sljit_sw(inputs.ps1_gte_read_data));
++        sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R3, 0, SLJIT_R0, 0);
++        sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R1, 0, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(base), SLJIT_IMM, imm);
++        ps1_fold(SLJIT_R1, SLJIT_R2);
++        sljit_emit_op1(compiler, SLJIT_MOV_U32, SLJIT_MEM2(Registers::rdram, SLJIT_R1), 0, SLJIT_R3, 0);
++    }
++    else {
++        sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R1, 0, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(base), SLJIT_IMM, imm);
++        ps1_fold(SLJIT_R1, SLJIT_R2);
++        sljit_emit_op1(compiler, SLJIT_MOV_U32, SLJIT_R2, 0, SLJIT_MEM2(Registers::rdram, SLJIT_R1), 0);
++        sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R0, 0, Registers::ctx, 0);
++        sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, cop2_reg);
++        sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS3V(P, 32, 32), SLJIT_IMM, sljit_sw(inputs.ps1_gte_write_data));
++    }
++    return true;
++}
++
++bool N64Recomp::LiveGenerator::emit_ps1_cop0_move(bool to_gpr, int gpr, int cop0_reg) const {
++    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R0, 0, Registers::ctx, 0);
++    sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, cop0_reg);
++    if (to_gpr) {
++        sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2(32, P, 32), SLJIT_IMM, sljit_sw(inputs.ps1_cop0_read));
++        if (gpr != 0) {
++            sljit_emit_op1(compiler, SLJIT_MOV_S32, SLJIT_R0, 0, SLJIT_R0, 0);
++            sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(gpr), SLJIT_R0, 0);
++        }
++    }
++    else {
++        sljit_sw src, srcw;
++        get_gpr_values(gpr, src, srcw);
++        sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R2, 0, src, srcw);
++        sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS3V(P, 32, 32), SLJIT_IMM, sljit_sw(inputs.ps1_cop0_write));
++    }
++    return true;
++}
++
++bool N64Recomp::LiveGenerator::emit_ps1_rfe() const {
++    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R0, 0, Registers::ctx, 0);
++    sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS1V(P), SLJIT_IMM, sljit_sw(inputs.ps1_rfe));
++    return true;
++}
++
++bool N64Recomp::LiveGenerator::emit_ps1_div(bool is_signed, int reg1, int reg2) const {
++    // the generator's division already gives the R3000's results for a zero divisor
++    emit_muldiv(is_signed ? InstrId::cpu_div : InstrId::cpu_divu, reg1, reg2);
++    return true;
++}
+diff --git a/ThirdParty/N64Recomp/include/recompiler/context.h b/ThirdParty/N64Recomp/include/recompiler/context.h
+index e7b4431..4fee63a 100644
+--- a/ThirdParty/N64Recomp/include/recompiler/context.h
++++ b/ThirdParty/N64Recomp/include/recompiler/context.h
+@@ -270,6 +270,9 @@ namespace N64Recomp {
+ 
+         // Causes functions to print their name to the console the first time they're called.
+         bool trace_mode;
++        // com.recomp.ps1: PlayStation code (MIPS R3000A + GTE, little-endian data): cop2 / GTE
++        // instructions go to the runtime, syscalls return, division never traps.
++        bool ps1 = false;
+ 
+         // Imports sections and function symbols from a provided context into this context's reference sections and reference functions.
+         bool import_reference_context(const Context& reference_context);
+diff --git a/ThirdParty/N64Recomp/include/recompiler/generator.h b/ThirdParty/N64Recomp/include/recompiler/generator.h
+index 145bcd0..9cab9f5 100644
+--- a/ThirdParty/N64Recomp/include/recompiler/generator.h
++++ b/ThirdParty/N64Recomp/include/recompiler/generator.h
+@@ -61,6 +61,19 @@ namespace N64Recomp {
+         virtual void emit_pause_self() const = 0;
+         virtual void emit_trigger_event(uint32_t event_index) const = 0;
+         virtual void emit_comment(const std::string& comment) const = 0;
++
++        // com.recomp.ps1 (Context::ps1). A generator without PS1 support returns false.
++        // A GTE command (cop2 with bit 25 set): the whole instruction word.
++        virtual bool emit_ps1_gte_command(uint32_t raw) const { (void)raw; return false; }
++        // mfc2 / cfc2 (to_gpr) or mtc2 / ctc2: a GTE data (control = false) or control register.
++        virtual bool emit_ps1_cop2_move(bool to_gpr, bool control, int gpr, int cop2_reg) const { (void)to_gpr; (void)control; (void)gpr; (void)cop2_reg; return false; }
++        // lwc2 / swc2: a GTE data register from / to memory at base + imm.
++        virtual bool emit_ps1_cop2_memory(bool store, int cop2_reg, int base, int16_t imm) const { (void)store; (void)cop2_reg; (void)base; (void)imm; return false; }
++        // mfc0 / mtc0 of any cop0 register, and rfe.
++        virtual bool emit_ps1_cop0_move(bool to_gpr, int gpr, int cop0_reg) const { (void)to_gpr; (void)gpr; (void)cop0_reg; return false; }
++        virtual bool emit_ps1_rfe() const { return false; }
++        // div / divu with the R3000's results for a zero divisor (never a host exception).
++        virtual bool emit_ps1_div(bool is_signed, int reg1, int reg2) const { (void)is_signed; (void)reg1; (void)reg2; return false; }
+     };
+ 
+     class CGenerator final : Generator {
+@@ -98,6 +111,12 @@ namespace N64Recomp {
+         void emit_pause_self() const final;
+         void emit_trigger_event(uint32_t event_index) const final;
+         void emit_comment(const std::string& comment) const final;
++        bool emit_ps1_gte_command(uint32_t raw) const final;
++        bool emit_ps1_cop2_move(bool to_gpr, bool control, int gpr, int cop2_reg) const final;
++        bool emit_ps1_cop2_memory(bool store, int cop2_reg, int base, int16_t imm) const final;
++        bool emit_ps1_cop0_move(bool to_gpr, int gpr, int cop0_reg) const final;
++        bool emit_ps1_rfe() const final;
++        bool emit_ps1_div(bool is_signed, int reg1, int reg2) const final;
+     private:
+         void get_operand_string(Operand operand, UnaryOpType operation, const InstructionContext& context, std::string& operand_string) const;
+         void get_binary_expr_string(BinaryOpType type, const BinaryOperands& operands, const InstructionContext& ctx, const std::string& output, std::string& expr_string) const;
+diff --git a/ThirdParty/N64Recomp/include/recompiler/live_recompiler.h b/ThirdParty/N64Recomp/include/recompiler/live_recompiler.h
+index d155b83..58c8881 100644
+--- a/ThirdParty/N64Recomp/include/recompiler/live_recompiler.h
++++ b/ThirdParty/N64Recomp/include/recompiler/live_recompiler.h
+@@ -86,6 +86,32 @@ namespace N64Recomp {
+         // Maps section index in the generated code to original section index. Used by regenerated
+         // code to relocate using the corresponding original section's address.
+         std::vector<size_t> original_section_indices;
++        // com.recomp.n64: functions the host implements instead (reimplemented / ignored ones, which
++        // get no recompiled body): calls to these function indices go straight to the host function.
++        std::unordered_map<size_t, recomp_func_t*> external_functions;
++        // com.recomp.n64: preemption points on loop back edges. Every backward jump decrements
++        // *loop_budget and calls loop_preempt(rdram, ctx, loop_vram) when it goes below 0.
++        int32_t* loop_budget = nullptr;
++        void (*loop_preempt)(uint8_t* rdram, recomp_context* ctx, uint32_t loop_vram) = nullptr;
++
++        // com.recomp.ps1: PlayStation code. `rdram` is the guest memory buffer (no offset) and
++        // addresses fold onto it as Source/Wasm/ps1w.h's PS1W_OFFSET does; data is little-endian
++        // (no swizzles). The GTE, cop0 and setjmp go to these host functions.
++        bool ps1 = false;
++        void (*ps1_gte_command)(recomp_context* ctx, uint32_t instruction) = nullptr;
++        uint32_t (*ps1_gte_read_data)(recomp_context* ctx, int reg) = nullptr;
++        void (*ps1_gte_write_data)(recomp_context* ctx, int reg, uint32_t value) = nullptr;
++        uint32_t (*ps1_gte_read_ctrl)(recomp_context* ctx, int reg) = nullptr;
++        void (*ps1_gte_write_ctrl)(recomp_context* ctx, int reg, uint32_t value) = nullptr;
++        uint32_t (*ps1_cop0_read)(recomp_context* ctx, int reg) = nullptr;
++        void (*ps1_cop0_write)(recomp_context* ctx, int reg, uint32_t value) = nullptr;
++        void (*ps1_rfe)(recomp_context* ctx) = nullptr;
++        // setjmp: begin() gives the host jmp_buf for the guest one (a0), `setjmp_fn` is the C
++        // runtime's _setjmp, called from the generated code itself with a null frame (so longjmp
++        // comes back without unwinding), resume() restores the guest registers after a longjmp.
++        void* (*ps1_setjmp_begin)(uint8_t* rdram, recomp_context* ctx) = nullptr;
++        void* ps1_setjmp_fn = nullptr;
++        void (*ps1_setjmp_resume)(uint8_t* rdram, recomp_context* ctx, int value) = nullptr;
+     };
+     class LiveGenerator final : public Generator {
+     public:
+@@ -106,7 +132,7 @@ namespace N64Recomp {
+         void emit_function_call_lookup(uint32_t addr) const final;
+         void emit_function_call_by_register(int reg) const final;
+         void emit_function_call_reference_symbol(const Context& context, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset) const final;
+-        void emit_function_call(const Context& context, size_t function_index) const final;
++        void emit_function_call(const Context& recomp_context, size_t function_index) const final;
+         void emit_named_function_call(const std::string& function_name) const final;
+         void emit_goto(const std::string& target) const final;
+         void emit_label(const std::string& label_name) const final;
+@@ -130,7 +156,15 @@ namespace N64Recomp {
+         void emit_pause_self() const final;
+         void emit_trigger_event(uint32_t event_index) const final;
+         void emit_comment(const std::string& comment) const final;
++        bool emit_ps1_gte_command(uint32_t raw) const final;
++        bool emit_ps1_cop2_move(bool to_gpr, bool control, int gpr, int cop2_reg) const final;
++        bool emit_ps1_cop2_memory(bool store, int cop2_reg, int base, int16_t imm) const final;
++        bool emit_ps1_cop0_move(bool to_gpr, int gpr, int cop0_reg) const final;
++        bool emit_ps1_rfe() const final;
++        bool emit_ps1_div(bool is_signed, int reg1, int reg2) const final;
+     private:
++        // com.recomp.ps1: folds the guest address in `reg` onto the memory buffer
++        void ps1_fold(int reg, int scratch) const;
+         void get_operand_string(Operand operand, UnaryOpType operation, const InstructionContext& context, std::string& operand_string) const;
+         void get_binary_expr_string(BinaryOpType type, const BinaryOperands& operands, const InstructionContext& ctx, const std::string& output, std::string& expr_string) const;
+         void get_notation(BinaryOpType op_type, std::string& func_string, std::string& infix_string) const;
+@@ -138,6 +172,8 @@ namespace N64Recomp {
+         void load_relocated_address(const InstructionContext& ctx, int reg) const;
+         sljit_compiler* compiler;
+         LiveGeneratorInputs inputs;
++        // rdram's offset from the address it maps (N64: KSEG0; com.recomp.ps1: 0)
++        intptr_t rdram_offset;
+         mutable std::unique_ptr<LiveGeneratorContext> context;
+         mutable bool errored;
+     };
+diff --git a/ThirdParty/N64Recomp/src/analysis.cpp b/ThirdParty/N64Recomp/src/analysis.cpp
+index 9eaaa30..456c3a0 100644
+--- a/ThirdParty/N64Recomp/src/analysis.cpp
++++ b/ThirdParty/N64Recomp/src/analysis.cpp
+@@ -340,6 +340,12 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
+         }
+ 
+         if (cur_jtbl.entries.size() == 0) {
++            // com.recomp.ps1: a table of function pointers filled at run time (a handler table in
++            // BSS), not a switch: the jr stays an indirect tail call, resolved when it runs
++            if (context.ps1) {
++                fmt::print("[Info] 0x{:08X} in {}: jumps through a run-time table at 0x{:08X} (indirect call)\n", cur_jtbl.jr_vram, func.name, cur_jtbl.vram);
++                continue;
++            }
+             fmt::print("Failed to determine size of jump table at 0x{:08X} for instruction at 0x{:08X}\n", cur_jtbl.vram, cur_jtbl.jr_vram);
+             return false;
+         }
+@@ -347,5 +353,9 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
+         //fmt::print("Jtbl at 0x{:08X} (rom 0x{:08X}) with {} entries used by instr at 0x{:08X}\n", cur_jtbl.vram, cur_jtbl.rom, cur_jtbl.entries.size(), cur_jtbl.jr_vram);
+     }
+ 
++    // (com.recomp.ps1: the run-time tables above aren't jump tables)
++    stats.jump_tables.erase(std::remove_if(stats.jump_tables.begin(), stats.jump_tables.end(),
++        [](const JumpTable& jtbl) { return jtbl.entries.empty(); }), stats.jump_tables.end());
++
+     return true;
+ }
+diff --git a/ThirdParty/N64Recomp/src/cgenerator.cpp b/ThirdParty/N64Recomp/src/cgenerator.cpp
+index 94f85c5..c9d4163 100644
+--- a/ThirdParty/N64Recomp/src/cgenerator.cpp
++++ b/ThirdParty/N64Recomp/src/cgenerator.cpp
+@@ -421,6 +421,12 @@ void N64Recomp::CGenerator::emit_function_call_reference_symbol(const Context& c
+ }
+ 
+ void N64Recomp::CGenerator::emit_function_call(const Context& context, size_t function_index) const {
++    // com.recomp.ps1: setjmp returns twice, so it is a host setjmp in this very function (the
++    // runtime keeps the guest registers with it; longjmp comes back here)
++    if (context.ps1 && context.functions[function_index].name == "setjmp_recomp") {
++        fmt::print(output_file, "{{ int ps1_jv = setjmp(*ps1_setjmp_begin(rdram, ctx)); if (ps1_jv) ps1_setjmp_resume(rdram, ctx, ps1_jv); else ctx->r2 = 0; }}\n");
++        return;
++    }
+     fmt::print(output_file, "{}(rdram, ctx);\n", context.functions[function_index].name);
+ }
+ 
+@@ -658,3 +664,54 @@ void N64Recomp::CGenerator::process_store_op(const StoreOp& op, const Instructio
+             break;
+     }
+ }
++
++// ---- com.recomp.ps1 ---------------------------------------------------------------------------
++// The runtime's recomp_ps1.h defines these (GTE register file, cop0, R3000 division).
++bool N64Recomp::CGenerator::emit_ps1_gte_command(uint32_t raw) const {
++    fmt::print(output_file, "ps1_gte_command(ctx, 0x{:08X});\n", raw);
++    return true;
++}
++
++bool N64Recomp::CGenerator::emit_ps1_cop2_move(bool to_gpr, bool control, int gpr, int cop2_reg) const {
++    const char* kind = control ? "ctrl" : "data";
++    if (to_gpr) {
++        if (gpr != 0) {
++            fmt::print(output_file, "{} = S32(ps1_gte_read_{}(ctx, {}));\n", gpr_to_string(gpr), kind, cop2_reg);
++        } else {
++            fmt::print(output_file, "ps1_gte_read_{}(ctx, {});\n", kind, cop2_reg);
++        }
++    } else {
++        fmt::print(output_file, "ps1_gte_write_{}(ctx, {}, U32({}));\n", kind, cop2_reg, gpr_to_string(gpr));
++    }
++    return true;
++}
++
++bool N64Recomp::CGenerator::emit_ps1_cop2_memory(bool store, int cop2_reg, int base, int16_t imm) const {
++    if (store) {
++        fmt::print(output_file, "MEM_W({}, {}) = (int32_t)ps1_gte_read_data(ctx, {});\n", (int)imm, gpr_to_string(base), cop2_reg);
++    } else {
++        fmt::print(output_file, "ps1_gte_write_data(ctx, {}, U32(MEM_W({}, {})));\n", cop2_reg, (int)imm, gpr_to_string(base));
++    }
++    return true;
++}
++
++bool N64Recomp::CGenerator::emit_ps1_cop0_move(bool to_gpr, int gpr, int cop0_reg) const {
++    if (to_gpr) {
++        if (gpr != 0) {
++            fmt::print(output_file, "{} = S32(ps1_cop0_read(ctx, {}));\n", gpr_to_string(gpr), cop0_reg);
++        }
++    } else {
++        fmt::print(output_file, "ps1_cop0_write(ctx, {}, U32({}));\n", cop0_reg, gpr_to_string(gpr));
++    }
++    return true;
++}
++
++bool N64Recomp::CGenerator::emit_ps1_rfe() const {
++    fmt::print(output_file, "ps1_rfe(ctx);\n");
++    return true;
++}
++
++bool N64Recomp::CGenerator::emit_ps1_div(bool is_signed, int reg1, int reg2) const {
++    fmt::print(output_file, "{}(&lo, &hi, U32({}), U32({}));\n", is_signed ? "PS1_DIV" : "PS1_DIVU", gpr_to_string(reg1), gpr_to_string(reg2));
++    return true;
++}
+diff --git a/ThirdParty/N64Recomp/src/config.cpp b/ThirdParty/N64Recomp/src/config.cpp
+index 1066aff..50af1d6 100644
+--- a/ThirdParty/N64Recomp/src/config.cpp
++++ b/ThirdParty/N64Recomp/src/config.cpp
+@@ -297,6 +297,10 @@ N64Recomp::Config::Config(const char* path) {
+ 
+         // Input section (required)
+         const auto input_data = config_data["input"];
++        // com.recomp.ps1: [input] arch = "ps1"
++        const std::optional<std::string> arch_opt = input_data["arch"].value<std::string>();
++        ps1 = arch_opt.has_value() && arch_opt.value() == "ps1";
++
+         const auto entrypoint_data = input_data["entrypoint"];
+ 
+         if (entrypoint_data) {
+diff --git a/ThirdParty/N64Recomp/src/config.h b/ThirdParty/N64Recomp/src/config.h
+index 7d6db23..ce51f7a 100644
+--- a/ThirdParty/N64Recomp/src/config.h
++++ b/ThirdParty/N64Recomp/src/config.h
+@@ -45,6 +45,8 @@ namespace N64Recomp {
+         bool unpaired_lo16_warnings;
+         bool use_mdebug;
+         bool trace_mode;
++        // [input] arch = "ps1" (com.recomp.ps1)
++        bool ps1 = false;
+         bool allow_exports;
+         bool strict_patch_mode;
+         std::filesystem::path elf_path;
+diff --git a/ThirdParty/N64Recomp/src/main.cpp b/ThirdParty/N64Recomp/src/main.cpp
+index 669c4a1..198ca26 100644
+--- a/ThirdParty/N64Recomp/src/main.cpp
++++ b/ThirdParty/N64Recomp/src/main.cpp
+@@ -471,7 +471,8 @@ int main(int argc, char** argv) {
+ 
+             for (uint32_t func_index : context.functions_by_vram[config.entrypoint]) {
+                 auto& func = context.functions[func_index];
+-                if (func.rom == 0x1000) {
++                // (com.recomp.ps1: a PS-X EXE's entry point is wherever its header says)
++                if (func.rom == 0x1000 || config.ps1) {
+                     rename_function(func_index, "recomp_entrypoint");
+                     found_entrypoint = true;
+                     break;
+@@ -551,6 +552,7 @@ int main(int argc, char** argv) {
+ 
+     // Propogate the trace mode parameter.
+     context.trace_mode = config.trace_mode;
++    context.ps1 = config.ps1;
+ 
+     // Apply any single-instruction patches.
+     for (const N64Recomp::InstructionPatch& patch : config.instruction_patches) {
+diff --git a/ThirdParty/N64Recomp/src/recompilation.cpp b/ThirdParty/N64Recomp/src/recompilation.cpp
+index c228433..c9ef54c 100644
+--- a/ThirdParty/N64Recomp/src/recompilation.cpp
++++ b/ThirdParty/N64Recomp/src/recompilation.cpp
+@@ -46,7 +46,10 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
+ 
+             // Zero-sized symbol handling. unless there's only one matching target.
+             if (target_func.words.empty()) {
+-                if (!N64Recomp::is_manual_patch_symbol(target_func.vram)) {
++                // (com.recomp.ps1: a size-0 <name>_recomp is a runtime function, called by name)
++                const bool runtime_func = context.ps1 && target_func.name.size() > 7 &&
++                    target_func.name.compare(target_func.name.size() - 7, 7, "_recomp") == 0;
++                if (!N64Recomp::is_manual_patch_symbol(target_func.vram) && !runtime_func) {
+                     continue;
+                 }
+             }
+@@ -410,6 +413,67 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+ 
+     bool handled = true;
+ 
++    // com.recomp.ps1: the GTE's commands (cop2 with bit 25 set; the CPU decoder doesn't know
++    // them) and the R3000's coprocessor moves
++    if (context.ps1) {
++        const uint32_t raw = instr.getRaw();
++        const uint32_t opcode = raw >> 26;
++        bool done = false;
++        bool ok = true;
++        if (opcode == 0x12 && (raw & 0x02000000)) {
++            print_indent();
++            ok = generator.emit_ps1_gte_command(raw);
++            done = true;
++        }
++        else if (opcode == 0x12 && ((raw >> 21) & 0x1F) <= 6) {
++            // mfc2 0, cfc2 2, mtc2 4, ctc2 6: rt = GPR, rd = GTE register
++            const uint32_t fmt_field = (raw >> 21) & 0x1F;
++            const int gpr = (int)((raw >> 16) & 0x1F);
++            const int reg = (int)((raw >> 11) & 0x1F);
++            if (fmt_field == 0 || fmt_field == 2 || fmt_field == 4 || fmt_field == 6) {
++                print_indent();
++                ok = generator.emit_ps1_cop2_move(fmt_field < 4, fmt_field == 2 || fmt_field == 6, gpr, reg);
++                done = true;
++            }
++        }
++        else if (opcode == 0x32 || opcode == 0x3A) {
++            // lwc2 / swc2: rt = GTE data register, base + imm16
++            print_indent();
++            ok = generator.emit_ps1_cop2_memory(opcode == 0x3A, (int)((raw >> 16) & 0x1F), (int)((raw >> 21) & 0x1F), (int16_t)(raw & 0xFFFF));
++            done = true;
++        }
++        else if (opcode == 0x10) {
++            const uint32_t fmt_field = (raw >> 21) & 0x1F;
++            if (fmt_field == 0 || fmt_field == 4) {
++                // mfc0 / mtc0, any register
++                print_indent();
++                ok = generator.emit_ps1_cop0_move(fmt_field == 0, (int)((raw >> 16) & 0x1F), (int)((raw >> 11) & 0x1F));
++                done = true;
++            }
++            else if ((raw & 0x0200003F) == 0x02000010) {
++                print_indent();
++                ok = generator.emit_ps1_rfe();
++                done = true;
++            }
++        }
++        else if (instr_id == InstrId::cpu_div || instr_id == InstrId::cpu_divu) {
++            print_indent();
++            ok = generator.emit_ps1_div(instr_id == InstrId::cpu_div, rs, rt);
++            done = true;
++        }
++        if (done) {
++            if (!ok) {
++                fmt::print(stderr, "PS1 instruction 0x{:08X} at 0x{:08X} not supported by this generator\n", raw, instr_vram);
++                return false;
++            }
++            if (emit_link_branch) {
++                print_indent();
++                generator.emit_label(fmt::format("after_{}", link_branch_index));
++            }
++            return true;
++        }
++    }
++
+     switch (instr_id) {
+     case InstrId::cpu_nop:
+         fmt::print(output_file, "\n");
+@@ -563,9 +627,12 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+     case InstrId::cpu_syscall:
+         print_indent();
+         generator.emit_syscall(instr_vram);
+-        // syscalls don't link, so treat it like a tail call
+-        print_indent();
+-        generator.emit_return(context, func_index);
++        // syscalls don't link, so treat it like a tail call (com.recomp.ps1: a PS1 syscall
++        // returns to the next instruction)
++        if (!context.ps1) {
++            print_indent();
++            generator.emit_return(context, func_index);
++        }
+         break;
+     case InstrId::cpu_break:
+         print_indent();

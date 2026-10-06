@@ -16,6 +16,7 @@
 
 #include "../Runtime/port/include/port_shm.h"
 #include "Ps1GuestHost.h"
+#include "Ps1Launcher.h"
 #include "Ps1Provider.h"
 #include "Ps1Widgets.h"
 #include "Wasm/ps1w_module.h"
@@ -187,6 +188,18 @@ Ps1Player::~Ps1Player()
 void Ps1Player::SetEngineAPI(PolyphaseEngineAPI* api)
 {
     sAPI = api;
+}
+
+void Ps1Player::RestartGame(const std::string& package)
+{
+    for (Ps1Player* player : sLivePlayers)
+    {
+        if (player->mGame == package && player->mStartAttempted)
+        {
+            player->StopGame();
+            player->mStartAttempted = false;
+        }
+    }
 }
 
 void Ps1Player::ShutdownAll()
@@ -1094,6 +1107,13 @@ bool Ps1Player::StartGuest(const Ps1wModule* module)
         candidates.push_back(ResolvePath(mDiscPath));
         candidates.push_back(ResolvePath(mDiscPath + "/disc.idx"));
     }
+    // the disc the player chose in a launcher (Ps1Launcher.h)
+    const std::string chosen = Ps1Launcher::ChosenDisc(module->package);
+    if (!chosen.empty())
+    {
+        candidates.push_back(ResolvePath(chosen));
+        candidates.push_back(ResolvePath(chosen + "/disc.idx"));
+    }
     candidates.push_back(ResolvePath("Packages/" + std::string(module->package) + "/Assets/Disc/disc.idx"));
     candidates.push_back(ResolvePath("Assets/Disc/disc.idx"));
     if (!discPath.empty() && discPath != mDiscPath)
@@ -1134,6 +1154,11 @@ bool Ps1Player::StartGuest(const Ps1wModule* module)
     if (saveDir.empty())
     {
         saveDir = "Saves/" + std::string(module->title);
+    }
+    // a game recompiled from the disc when it boots: its recompiler data, shipped in the package
+    if (module->set_data_dir != nullptr)
+    {
+        module->set_data_dir(ResolvePath("Packages/" + std::string(module->package) + "/Assets/Recomp/Live").c_str());
     }
     Ps1GuestHost::SetOptions(mGameOptions);
     if (!mGameOptions.empty())

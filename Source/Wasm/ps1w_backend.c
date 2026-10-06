@@ -36,6 +36,16 @@ void ps1w_register_module(const Ps1wModule *module)
     if (sModuleCount < MAX_MODULES) sModules[sModuleCount++] = module;
 }
 
+int ps1w_module_count(void)
+{
+    return sModuleCount;
+}
+
+const Ps1wModule *ps1w_module_at(int index)
+{
+    return index >= 0 && index < sModuleCount ? sModules[index] : NULL;
+}
+
 const Ps1wModule *ps1w_find_module(const char *package)
 {
     int i;
@@ -128,9 +138,15 @@ void w2c_env_port_host_fatal(struct w2c_env *env, u32 msg)
 }
 
 /* ---- imports: disc ------------------------------------------------------------------ */
+/* Recomp mode: told about every disc read into guest memory (overlays loading). */
+void (*ps1w_disc_read_hook)(u32 lba, u32 count, u32 dst);
+
 u32 w2c_env_port_disc_read(struct w2c_env *env, u32 lba, u32 count, u32 dst)
 {
-    return (u32)port_disc_read(lba, count, guest_ptr(dst, count * 2048));
+    u32 ok = (u32)port_disc_read(lba, count, guest_ptr(dst, count * 2048));
+
+    if (ok && ps1w_disc_read_hook) ps1w_disc_read_hook(lba, count, dst);
+    return ok;
 }
 
 u32 w2c_env_port_disc_read_raw(struct w2c_env *env, u32 lba, u32 dst)

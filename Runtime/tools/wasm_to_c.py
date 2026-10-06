@@ -17,14 +17,18 @@
 Usage: wasm_to_c.py <wasm2c.exe> <in.wasm> <out_dir> <name> <num_outputs>
                     [--package=<id>] [--title=<text>] [--disc=<file name>]
                     [--runtime-include=<path prefix of Source/Wasm>] [--register]
+                    [--define=<macro>] (defined at the top of the -impl.h: PS1W_RECOMP)
 Writes <out_dir>/<name>_guest.h, _guest-impl.h, _guest_0.c ..., _guest_module.c,
 [_guest_register.cpp] and <name>_stubs.txt; the wasm2c module is named <name>.
 """
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
 
 
 # ---- wasm binary: trim data segments ----------------------------------------------
@@ -201,6 +205,9 @@ struct Register
         os.remove(reg)
 
 
+FUNCREF_RE = re.compile(r"([A-Za-z_][\w>\-.]*_table)\.data\[(var_\w+)\]\.module_instance")
+
+
 def fix_stubs(c_files, impl_text):
     decls = {name: (ret, param_types(params)) for ret, name, params in DECL_RE.findall(impl_text)}
     report = []
@@ -233,10 +240,101 @@ def fix_stubs(c_files, impl_text):
             return f"{static or ''}{ret} {prefix}_signature_mismatch0x3A{target}({params}) {{\n{body}}}\n"
 
         new = STUB_RE.sub(repl, text)
+        # call_indirect passes the slot's module instance as an argument, read before the slot
+        # is checked: with a PS1 code address for a slot (recomp mode callbacks, Source/Wasm/
+        # ps1w_ops.h) that read is out of bounds, so it goes through a checked accessor
+        new = FUNCREF_RE.sub(r"PS1W_FUNCREF_INSTANCE(\1, \2)", new)
         if new != text:
             with open(path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(new)
     return report
+
+
+def replace_with_retry(src, dst, attempts=40, delay=0.25):
+    # Windows: a generated file another process still has open (the editor's addon build,
+    # an IDE indexer, antivirus scanning the new file) can't be replaced for a moment.
+    for i in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
+# WABT's Windows release builds of wasm2c link OpenSSL (libcrypto-3-x64.dll) but don't ship
+# it. Shells often find it on PATH (Git for Windows has one), the editor and other
+# launchers often don't: wasm2c then dies with STATUS_DLL_NOT_FOUND.
+WASM2C_DLLS = ["libcrypto-3-x64.dll"]
+STATUS_DLL_NOT_FOUND = 0xC0000135
+
+
+def dll_dirs_for_windows():
+    dirs = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d]
+    git = shutil.which("git")
+    if git:
+        root = os.path.dirname(os.path.dirname(os.path.realpath(git)))  # <Git>\cmd or \bin -> <Git>
+        if os.path.basename(root).lower() == "mingw64":
+            root = os.path.dirname(root)
+        dirs += [os.path.join(root, "mingw64", "bin"), os.path.join(root, "usr", "bin")]
+    for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramW6432"), os.environ.get("ProgramFiles(x86)"),
+                 os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")):
+        if base:
+            dirs += [os.path.join(base, "Git", "mingw64", "bin"), os.path.join(base, "OpenSSL-Win64", "bin")]
+    dirs += [r"C:\msys64\mingw64\bin", r"C:\msys64\ucrt64\bin"]
+    return dirs
+
+
+def wasm2c_env(wasm2c):
+    """The environment to run wasm2c in: PATH extended by the folders holding the DLLs it
+    needs and that aren't next to it."""
+    env = dict(os.environ)
+    if os.name != "nt":
+        return env
+    here = os.path.dirname(os.path.abspath(wasm2c))
+    extra = []
+    for dll in WASM2C_DLLS:
+        if os.path.isfile(os.path.join(here, dll)):
+            continue
+        found = next((d for d in dll_dirs_for_windows() if os.path.isfile(os.path.join(d, dll))), None)
+        if found is None:
+            sys.exit(f"wasm2c needs {dll} (OpenSSL 3), which WABT's release doesn't include: install Git for "
+                     f"Windows (it has one), or copy {dll} next to {wasm2c}")
+        if found not in extra:
+            extra.append(found)
+    if extra:
+        env["PATH"] = os.pathsep.join(extra + [env.get("PATH", "")])
+    return env
+
+
+def run_wasm2c(wasm2c, trimmed, name, outputs, out_dir, stem):
+    # wasm2c writes into a scratch folder next to out_dir; the old files are replaced only
+    # once it succeeded, so a failure (or a locked file) never leaves out_dir half empty.
+    env = wasm2c_env(wasm2c)
+    tmp = tempfile.mkdtemp(prefix=".wasm2c-", dir=out_dir)
+    try:
+        cmd = [wasm2c, trimmed, "-n", name, "--num-outputs=" + outputs, "--disable-tail-call",
+               "-o", os.path.join(tmp, stem + ".c")]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        if proc.returncode != 0:
+            sys.stderr.write(proc.stdout or "")
+            if (proc.returncode & 0xFFFFFFFF) == STATUS_DLL_NOT_FOUND:
+                sys.exit(f"wasm2c could not start: a DLL it needs is missing (STATUS_DLL_NOT_FOUND). Put the "
+                         f"DLLs wasm2c.exe imports next to it ({wasm2c}).")
+            sys.exit(f"wasm2c failed (exit {proc.returncode}): {' '.join(cmd)}")
+        made = set(os.listdir(tmp))
+        for f in sorted(made):
+            dst = os.path.join(out_dir, f)
+            try:
+                replace_with_retry(os.path.join(tmp, f), dst)
+            except PermissionError as e:
+                sys.exit(f"wasm2c: cannot replace {dst}: {e} (is it open in another program?)")
+        for old in os.listdir(out_dir):
+            if old.startswith(stem) and (old.endswith(".c") or old.endswith(".h")) and old not in made:
+                os.remove(os.path.join(out_dir, old))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main():
@@ -250,15 +348,14 @@ def main():
     trimmed = os.path.splitext(src)[0] + ".trimmed.wasm"
     with open(trimmed, "wb") as f:
         f.write(wasm)
-    for old in os.listdir(out_dir):
-        if old.startswith(stem) and (old.endswith(".c") or old.endswith(".h")):
-            os.remove(os.path.join(out_dir, old))
-    out_c = os.path.join(out_dir, stem + ".c")
-    cmd = [wasm2c, trimmed, "-n", name, "--num-outputs=" + outputs, "--disable-tail-call", "-o", out_c]
-    if subprocess.call(cmd) != 0:
-        sys.exit("wasm2c failed")
+    run_wasm2c(wasm2c, trimmed, name, outputs, out_dir, stem)
     patch_header(os.path.join(out_dir, stem + ".h"), prefix)
     impl_text = patch_impl(os.path.join(out_dir, stem + "-impl.h"), prefix)
+    if "define" in opts:
+        impl_path = os.path.join(out_dir, stem + "-impl.h")
+        impl_text = f"#define {opts['define']} 1\n" + impl_text
+        with open(impl_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(impl_text)
     c_files = [os.path.join(out_dir, f"{stem}_{i}.c") for i in range(int(outputs))]
     report = fix_stubs(c_files, impl_text)
     with open(os.path.join(out_dir, name + "_stubs.txt"), "w", newline="\n") as f:

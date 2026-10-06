@@ -115,6 +115,8 @@
     <ClCompile Include="Source\Guest\dw\dw_guest_register.cpp" />
     <ClCompile Include="Source\Ps1Dependencies.cpp" />
     <ClInclude Include="Source\Ps1Dependencies.h" />
+    <ClCompile Include="Source\Ps1Launcher.cpp" />
+    <ClInclude Include="Source\Ps1Launcher.h" />
     <ClCompile Include="Source\Ps1GameUIs.cpp" />
     <ClInclude Include="Source\Ps1GameUIs.h" />
     <ClCompile Include="Source\Ps1GuestHost.cpp" />
@@ -123,6 +125,8 @@
     <ClInclude Include="Source\Ps1Lua.h" />
     <ClCompile Include="Source\Ps1Player.cpp" />
     <ClInclude Include="Source\Ps1Player.h" />
+    <ClCompile Include="Source\Ps1Provider.cpp" />
+    <ClInclude Include="Source\Ps1Provider.h" />
     <ClCompile Include="Source\Ps1Widgets.cpp" />
     <ClInclude Include="Source\Ps1Widgets.h" />
     <ClInclude Include="Source\Wasm\ps1w.h" />

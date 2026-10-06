@@ -19,6 +19,7 @@
 
 #include "Ps1Dependencies.h"
 #include "Ps1GameUIs.h"
+#include "Ps1Launcher.h"
 #include "Ps1Lua.h"
 #include "Ps1Player.h"
 #include "Ps1Provider.h"
@@ -41,6 +42,8 @@ static int OnLoad(PolyphaseEngineAPI* api)
     FORCE_LINK_CALL(Ps1MenuController);
     // com.recomp.mod.base (mod settings, Recomp / Mods Lua, Mods windows) sees the PS1 game
     Recomp_RegisterProvider(&Ps1Provider::Get());
+    // ... and its launchers (RecompLauncher, Recomp.SetRomLocation / StartGame): one per game
+    Ps1Launcher::RegisterAll();
     if (api && api->LogDebug)
     {
         api->LogDebug("com.recomp.ps1 loaded!");
@@ -52,6 +55,7 @@ static void OnUnload()
 {
     // Game processes are driven by this module's node instances: stop them first.
     Ps1Player::ShutdownAll();
+    Ps1Launcher::UnregisterAll();
     Recomp_UnregisterProvider(&Ps1Provider::Get());
     // a background pre-process thread runs this module's code: stop it (its builds are killed)
     Ps1Dependencies::Shutdown();
@@ -90,6 +94,12 @@ static bool OnPreBuild(int32_t platform, void* userData)
     {
         return true;
     }
+    char mode[16] = "";
+    if (sHooks != nullptr && sHooks->GetBuildSetting != nullptr)
+    {
+        sHooks->GetBuildSetting(Ps1Dependencies::kModeOption, mode, sizeof(mode));
+    }
+    Ps1Dependencies::SetBuildMode(mode);
     if (!Ps1Dependencies::SetupAll())
     {
         if (sEngineAPI && sEngineAPI->LogError)

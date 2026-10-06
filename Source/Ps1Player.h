@@ -43,6 +43,9 @@ public:
     static void SetEngineAPI(PolyphaseEngineAPI* api);
     // Stops every running game process; called when the addon unloads.
     static void ShutdownAll();
+    // Starts the game of every player of a package again on its next tick (the launcher's
+    // Play: the disc the player chose)
+    static void RestartGame(const std::string& package);
 
 private:
     bool StartGame();

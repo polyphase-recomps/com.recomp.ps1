@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -58,6 +59,8 @@ struct GamePackage
     std::string packageDir; // ...\Packages\<id>\ (backslashes, trailing)
     std::string nativeDir;  // ...\Packages\<id>\Native\ (backslashes, trailing)
     RomConfig rom;
+    bool hasDecomp = false;  // Native/ builds the game from its decomp (Ps1Game.cmake)
+    std::string recompName;  // Recomp/game.json "name" ("" = no Recomp/: Decomp mode only)
 };
 
 struct GameStatus
@@ -67,6 +70,7 @@ struct GameStatus
     bool loaded = false;     // the translated game is in the addon this editor loaded
     bool translated = false; // the translated game is in com.recomp.ps1/Source/Guest
     bool extracted = false;  // the disc is extracted into the package's Assets/Disc
+    std::string mode;        // what is in the addon: "decomp", "recomp", "recomp-live" ("" = nothing)
 };
 
 std::mutex sLock;
@@ -240,16 +244,22 @@ std::vector<GamePackage> FindGamePackages()
             continue;
         }
         const std::string native = packages + fd.cFileName + "\\Native\\";
-        if (!FileContains(native + "CMakeLists.txt", "Ps1Game.cmake") || !Exists(native + "build.ps1"))
+        const std::string recomp = packages + fd.cFileName + "\\Recomp\\";
+        GamePackage game;
+        game.hasDecomp = FileContains(native + "CMakeLists.txt", "Ps1Game.cmake") && Exists(native + "build.ps1");
+        std::string json;
+        if (FileContains(recomp + "CMakeLists.txt", "Ps1Recomp.cmake") && ReadText(recomp + "game.json", json))
+        {
+            JsonString(json, "name", game.recompName);
+        }
+        if (!game.hasDecomp && game.recompName.empty())
         {
             continue;
         }
-        GamePackage game;
         game.id = fd.cFileName;
         game.packageDir = packages + fd.cFileName + "\\";
         game.nativeDir = native;
         game.title = game.id;
-        std::string json;
         if (ReadText(packages + fd.cFileName + "\\Assets\\game.json", json))
         {
             JsonString(json, "title", game.title);
@@ -286,8 +296,9 @@ bool FindGame(const std::string& id, GamePackage& out)
 }
 
 // ---- status ----------------------------------------------------------------------------
-// The translated game is on disk when a Source/Guest/<name>/<name>_guest_module.c of
-// com.recomp.ps1 registers this package id.
+// The game is in the addon's source when a Source/Guest/<name>/<name>_guest_module.c (Decomp)
+// or <name>_guest_register.cpp (Recomp: <name> = <game>_recomp) of com.recomp.ps1 names this
+// package id.
 bool TranslatedOnDisk(const std::string& id)
 {
     const std::string guests = ProjectDir() + "Packages\\com.recomp.ps1\\Source\\Guest\\";
@@ -304,12 +315,19 @@ bool TranslatedOnDisk(const std::string& id)
     {
         if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] != '.')
         {
-            const std::string module = guests + fd.cFileName + "\\" + fd.cFileName + "_guest_module.c";
-            found = FileContains(module, quoted.c_str());
+            const std::string base = guests + fd.cFileName + "\\" + fd.cFileName;
+            found = FileContains(base + "_guest_module.c", quoted.c_str()) ||
+                    FileContains(base + "_guest_register.cpp", quoted.c_str());
         }
     } while (!found && FindNextFileA(h, &fd));
     FindClose(h);
     return found;
+}
+
+// com.recomp.ps1/Source/Guest/<name>_recomp\ : the Recomp build of a game in the addon
+std::string RecompGuestDir(const GamePackage& game)
+{
+    return ProjectDir() + "Packages\\com.recomp.ps1\\Source\\Guest\\" + game.recompName + "_recomp\\";
 }
 
 GameStatus GetGameStatus(const GamePackage& game)
@@ -319,7 +337,16 @@ GameStatus GetGameStatus(const GamePackage& game)
     status.title = game.title;
     status.loaded = ps1w_find_module(game.id.c_str()) != nullptr;
     status.translated = status.loaded || TranslatedOnDisk(game.id);
-    status.extracted = Exists(game.nativeDir + "..\\Assets\\Disc\\disc.idx");
+    status.extracted = Exists(game.packageDir + "Assets\\Disc\\disc.idx");
+    std::string mode;
+    if (!game.recompName.empty() && ReadText(RecompGuestDir(game) + "mode.txt", mode))
+    {
+        status.mode = Trim(mode);
+    }
+    else if (status.translated)
+    {
+        status.mode = "decomp";
+    }
     return status;
 }
 
@@ -461,6 +488,8 @@ bool WriteLocalValue(const GamePackage& game, const std::string& name, const std
     {
         out += setLine + "\n";
     }
+    std::error_code ec;
+    std::filesystem::create_directories(game.nativeDir, ec); // a package with only Recomp/
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     file << out;
     return file.good();
@@ -824,9 +853,105 @@ void SetResult(const std::string& id, bool ok)
     }
 }
 
-// Runs one game package's build.ps1; its output goes to the log.
-bool RunSetup(const GamePackage& game, bool background)
+// ---- Build mode ---------------------------------------------------------------------------
+enum class Pipeline
 {
+    Decomp,     // Native/build.ps1: the decomp translated by wasm2c (Source/Guest/<name>)
+    Recomp,     // build_recomp.ps1: recompiled from the disc (Source/Guest/<name>_recomp)
+    RecompLive  // build_recomp.ps1 -Live: LiveRecomp, recompiled when the game boots
+};
+
+std::string sMode = "auto"; // the Build mode (kModeOption), under sLock
+
+const char* PipelineName(Pipeline p)
+{
+    return p == Pipeline::Recomp ? "Recomp" : p == Pipeline::RecompLive ? "Recomp (live)" : "Decomp";
+}
+
+// auto: as the game is in the addon now (Recomp / Recomp (live) once published so), else its
+// decomp, else Recomp (live) - it needs no disc to build
+Pipeline ChoosePipeline(const GamePackage& game, const std::string& mode)
+{
+    if (game.recompName.empty() || mode == "decomp")
+    {
+        return Pipeline::Decomp;
+    }
+    if (mode == "recomp")
+    {
+        return Pipeline::Recomp;
+    }
+    if (mode == "live")
+    {
+        return Pipeline::RecompLive;
+    }
+    std::string published;
+    if (ReadText(RecompGuestDir(game) + "mode.txt", published))
+    {
+        published = Trim(published);
+        if (published == "recomp") return Pipeline::Recomp;
+        if (published == "recomp-live") return Pipeline::RecompLive;
+    }
+    return game.hasDecomp ? Pipeline::Decomp : Pipeline::RecompLive;
+}
+
+std::string CurrentMode()
+{
+    std::lock_guard<std::mutex> guard(sLock);
+    return sMode;
+}
+
+// Runs build_recomp.ps1 for a game package's Recomp/ folder.
+bool RunRecompSetup(const GamePackage& game, Pipeline pipeline, bool background)
+{
+    std::string args = "-Package \"" + game.packageDir.substr(0, game.packageDir.size() - 1) + "\"";
+    if (pipeline == Pipeline::RecompLive)
+    {
+        args += " -Live";
+    }
+    else
+    {
+        // the disc image Pre Process Rom set (else build_recomp.ps1 finds one)
+        const std::string disc = Normalize(CurrentValue(game, game.rom.variable));
+        if (!disc.empty() && Exists(disc))
+        {
+            args += " -Disc \"" + disc + "\"";
+        }
+    }
+#if defined(_DEBUG)
+    args += " -DebugCrt"; // the addon is compiled with the editor's (debug) C runtime
+#endif
+    const std::string script =
+        ProjectDir() + "Packages\\com.recomp.ps1\\Runtime\\tools\\recomp\\build_recomp.ps1";
+    const std::string cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"" + script + "\" " + args;
+
+    Emit("[ps1] " + game.id + ": " + PipelineName(pipeline) + " (build_recomp.ps1 " + args + ")", background);
+    const int code = RunProcess(cmd, game.packageDir, background);
+    if (sCancel)
+    {
+        Emit("[ps1] " + game.id + ": cancelled", background);
+    }
+    else
+    {
+        Emit(std::string("[ps1] ") + game.id + (code == 0 ? ": built" : ": BUILD FAILED"), background);
+    }
+    SetResult(game.id, code == 0);
+    return code == 0 && !sCancel;
+}
+
+// Runs one game package's build.ps1; its output goes to the log.
+bool RunSetup(const GamePackage& game, const std::string& mode, bool background)
+{
+    const Pipeline pipeline = ChoosePipeline(game, mode);
+    if (pipeline != Pipeline::Decomp)
+    {
+        return RunRecompSetup(game, pipeline, background);
+    }
+    if (!game.hasDecomp)
+    {
+        Emit("[ps1] " + game.id + " has no decomp build (Native/): use Build mode Recomp or Recomp (live)", background);
+        SetResult(game.id, false);
+        return false;
+    }
     // only what the addon needs: the translated game and the extracted disc (target
     // ps1_addon), not the standalone test program
     const std::string args = "-Guest wasm -Target ps1_addon";
@@ -843,6 +968,19 @@ bool RunSetup(const GamePackage& game, bool background)
     {
         Emit(std::string("[ps1] ") + game.id + (code == 0 ? ": pre-processed" : ": PRE-PROCESSING FAILED"), background);
     }
+    // one module per game package: the game's Recomp build leaves the addon
+    if (code == 0 && !sCancel && !game.recompName.empty())
+    {
+        std::error_code ec;
+        const std::string dir = RecompGuestDir(game);
+        if (std::filesystem::exists(dir, ec))
+        {
+            std::filesystem::remove_all(dir, ec);
+            Emit("[ps1] " + game.id + ": removed its Recomp build from the addon (Source/Guest/" + game.recompName +
+                     "_recomp)",
+                 background);
+        }
+    }
     SetResult(game.id, code == 0);
     return code == 0 && !sCancel;
 }
@@ -855,7 +993,7 @@ bool RestoreDisc(const GamePackage& game, const std::string& disc, bool backgrou
     const std::string script = ProjectDir() + "Packages\\com.recomp.ps1\\Runtime\\tools\\extract_disc.py";
 
     Emit("[ps1] restoring the original disc files in " + out, background);
-    if (RunProcess("python.exe -u \"" + script + "\" --force \"" + disc + "\" \"" + out + "\"", game.nativeDir,
+    if (RunProcess("python.exe -u \"" + script + "\" --force \"" + disc + "\" \"" + out + "\"", game.packageDir,
                    background) == 0)
     {
         return true;
@@ -867,7 +1005,7 @@ bool RestoreDisc(const GamePackage& game, const std::string& disc, bool backgrou
     return false;
 }
 
-bool SetupGames(const std::vector<GamePackage>& games, bool background)
+bool SetupGames(const std::vector<GamePackage>& games, const std::string& mode, bool background)
 {
     bool ok = true;
     for (const GamePackage& game : games)
@@ -876,7 +1014,7 @@ bool SetupGames(const std::vector<GamePackage>& games, bool background)
         {
             return false;
         }
-        ok = RunSetup(game, background) && ok;
+        ok = RunSetup(game, mode, background) && ok;
     }
     return ok;
 }
@@ -908,13 +1046,14 @@ void StartAsync(const std::vector<GamePackage>& games, const std::string& runnin
     sRunStart = std::chrono::steady_clock::now();
     sCancel = false;
     sRunning = true;
-    sThread = std::thread([games, restoreDisc, disc]() {
+    const std::string mode = CurrentMode();
+    sThread = std::thread([games, restoreDisc, disc, mode]() {
         bool ok = true;
         if (restoreDisc && games.size() == 1)
         {
             ok = RestoreDisc(games[0], disc, true);
         }
-        ok = ok && SetupGames(games, true);
+        ok = ok && SetupGames(games, mode, true);
         if (sCancel)
         {
             Emit("[ps1] Pre-processing cancelled.", true);
@@ -1109,8 +1248,12 @@ bool DrawPreprocessModal(void* userData)
     // what is already processed
     ImGui::Separator();
     ImGui::TextUnformatted("Status");
-    TextStatus(m.status.translated, m.status.loaded ? "Game translated into com.recomp.ps1, loaded in this editor"
-                                                    : "Game translated into com.recomp.ps1");
+    const std::string built = m.status.mode == "recomp"        ? " (Recomp)"
+                              : m.status.mode == "recomp-live" ? " (Recomp (live))"
+                              : m.status.mode == "decomp"      ? " (Decomp)"
+                                                               : "";
+    TextStatus(m.status.translated, (m.status.loaded ? "Game built into com.recomp.ps1" + built + ", loaded in this editor"
+                                                     : "Game built into com.recomp.ps1" + built).c_str());
     TextStatus(m.status.extracted, ("Disc extracted to Packages/" + game.id + "/Assets/Disc").c_str());
     if (!m.processedFrom.empty() && (m.status.translated || m.status.extracted))
     {
@@ -1178,14 +1321,20 @@ bool DrawPreprocessModal(void* userData)
                               game.id.c_str());
         }
     }
+    const Pipeline pipeline = ChoosePipeline(game, CurrentMode());
+    const bool needsSource = pipeline == Pipeline::Decomp && !game.rom.sourceVariable.empty();
+    if (!game.recompName.empty())
+    {
+        ImGui::TextDisabled("Build mode (Target Options): %s", PipelineName(pipeline));
+    }
     const bool canRun = !running && !game.rom.variable.empty() && m.check.exists && m.check.sectorsOk &&
-                        !m.check.wrongGame && (game.rom.sourceVariable.empty() || m.sourceOk);
+                        !m.check.wrongGame && (!needsSource || m.sourceOk);
     if (!canRun) ImGui::BeginDisabled();
     if (ImGui::Button(m.status.translated || m.status.extracted ? "Pre Process again" : "Pre Process",
                       ImVec2(160.0f, 0.0f)))
     {
         bool saved = WriteLocalValue(game, game.rom.variable, m.check.path);
-        if (!game.rom.sourceVariable.empty())
+        if (!game.rom.sourceVariable.empty() && m.sourceOk)
         {
             saved = WriteLocalValue(game, game.rom.sourceVariable, Trim(m.source)) && saved;
         }
@@ -1273,7 +1422,7 @@ bool Ps1Dependencies::SetupAll()
     }
     Tick();
     sCancel = false;
-    const bool ok = SetupGames(FindGamePackages(), false);
+    const bool ok = SetupGames(FindGamePackages(), CurrentMode(), false);
     sStatusValid = false;
     ++sStatusGeneration;
     return ok;
@@ -1287,6 +1436,12 @@ void Ps1Dependencies::SetupAllAsync()
 bool Ps1Dependencies::IsRunning()
 {
     return sRunning;
+}
+
+void Ps1Dependencies::SetBuildMode(const char* mode)
+{
+    std::lock_guard<std::mutex> guard(sLock);
+    sMode = (mode != nullptr && mode[0] != 0) ? mode : "auto";
 }
 
 void Ps1Dependencies::Cancel()
@@ -1408,6 +1563,40 @@ void Ps1Dependencies::DrawTargetOptions(const PolyphaseBuildContext* ctx)
                           "Pick the ROM with Pre Process Rom below.");
     }
 
+    // Build mode: what each game in the addon is made from
+    char modeValue[16] = "";
+    if (ctx->GetProfileSetting != nullptr)
+    {
+        ctx->GetProfileSetting(kModeOption, modeValue, sizeof(modeValue));
+    }
+    const char* modeValues[] = {"auto", "decomp", "recomp", "live"};
+    int mode = 0;
+    for (int i = 0; i < 4; i++)
+    {
+        if (strcmp(modeValue, modeValues[i]) == 0) mode = i;
+    }
+    Ps1Dependencies::SetBuildMode(modeValues[mode]);
+    const char* modes[] = {"Auto (as each game was last built)", "Decomp", "Recomp (from your disc)",
+                           "Recomp (live: releases without game code)"};
+    if (ImGui::Combo("Build mode", &mode, modes, 4) && ctx->SetProfileSetting != nullptr)
+    {
+        ctx->SetProfileSetting(kModeOption, modeValues[mode]);
+        Ps1Dependencies::SetBuildMode(modeValues[mode]);
+    }
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Decomp: the game is compiled from its decompilation (Native/), translated by wasm2c.\n"
+                          "Every target.\n"
+                          "Recomp: the game is recompiled from your disc by N64Recomp (the package's Recomp/\n"
+                          "config) on the runtime's PsyQ libraries. For games whose decomp is unfinished.\n"
+                          "Windows x64 only; one recompiled game per project.\n"
+                          "Recomp (live): no game code in the build at all. LiveRecomp recompiles the\n"
+                          "player's own disc when the game boots, from the symbols shipped in the package.\n"
+                          "For PC releases.\n"
+                          "Auto: as the game was last built (decomp for a game never built in a Recomp mode).\n"
+                          "Games without Recomp/ always build in Decomp mode.");
+    }
+
     const bool running = sRunning;
     if (!sStatusValid && !running)
     {
@@ -1424,7 +1613,8 @@ void Ps1Dependencies::DrawTargetOptions(const PolyphaseBuildContext* ctx)
         ImGui::SameLine();
         if (IsReady(game))
         {
-            ImGui::Text("%s: ready", game.title.c_str());
+            ImGui::Text("%s: ready (%s)", game.title.c_str(),
+                        game.mode == "recomp" ? "Recomp" : game.mode == "recomp-live" ? "Recomp (live)" : "Decomp");
         }
         else if (NeedsRestart(game))
         {
@@ -1484,6 +1674,10 @@ void Ps1Dependencies::CheckReady()
 }
 
 void Ps1Dependencies::RegisterMenus(EditorUIHooks*, uint64_t)
+{
+}
+
+void Ps1Dependencies::SetBuildMode(const char*)
 {
 }
 
