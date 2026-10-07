@@ -152,6 +152,12 @@ void GameThreadBody()
     switch (setjmp(sExitJump))
     {
     case 0:
+#if defined(_MSC_VER) && defined(_M_X64)
+        // Stop and crash come back here with longjmp without unwinding (as on the other hosts):
+        // a recompiled game's code (LiveRecomp) has no unwind data, which an unwinding longjmp
+        // fails on (STATUS_BAD_FUNCTION_TABLE), and no frame in between holds anything to destroy
+        reinterpret_cast<_JUMP_BUFFER*>(&sExitJump)->Frame = 0;
+#endif
         ps1w_run();
         host_log("game returned from main()");
         sState = Ps1GuestHost::State::Exited;

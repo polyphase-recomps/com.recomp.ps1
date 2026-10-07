@@ -111,6 +111,15 @@ function Publish([string]$lib, [string]$mode, [string]$from) {
 #include "../../Wasm/ps1w_module.h"
 
 #pragma comment(lib, "$(Fwd $target)")
+// The library's C++ (N64Recomp's thread_locals) needs the C runtime's TLS destructor support.
+// The editor can hand a release addon a Debug Lua.lib, whose objects ask for the debug runtime
+// too; the linker would then take that support from it and fail (_malloc_dbg, _free_dbg).
+// Only the addon's own runtime is wanted.
+#if defined(_DEBUG)
+#pragma comment(linker, "/NODEFAULTLIB:msvcrt.lib")
+#else
+#pragma comment(linker, "/NODEFAULTLIB:msvcrtd.lib")
+#endif
 
 extern "C" const Ps1wModule $module;
 
