@@ -7,6 +7,8 @@
 
 #include "Engine.h"
 #include "Log.h"
+#include "Stream.h"
+#include "System/System.h"
 
 #include "Ps1Player.h"
 #include "Wasm/ps1w_module.h"
@@ -19,6 +21,7 @@
 #include <cstdio>
 #include <iterator>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <vector>
@@ -223,9 +226,57 @@ DiscFacts FactsFor(const std::string& package, const char* title)
     return facts;
 }
 
+// The disc the player chose is kept as a save, <package>.disc.txt: in the editor in the project's
+// Saves folder (SYS_WriteSave isn't exported to editor addons), in a packaged game in its save
+// storage (SYS_WriteSave: the game's own folder can't be written, or has no Saves folder).
+std::string SaveName(const std::string& package)
+{
+    return package + ".disc.txt";
+}
+
 std::string SavePath(const std::string& package)
 {
-    return ProjectPath("Saves/" + package + ".disc.txt");
+    return ProjectPath("Saves/" + SaveName(package));
+}
+
+bool WriteChosenDisc(const std::string& package, const std::string& disc, std::string& where)
+{
+#if EDITOR
+    where = SavePath(package);
+    std::error_code ec;
+    std::filesystem::create_directories(ProjectPath("Saves"), ec);
+    std::ofstream file(where, std::ios::binary | std::ios::trunc);
+    file << disc;
+    return file.good();
+#else
+    where = "the save " + SaveName(package);
+    Stream stream;
+    stream.WriteBytes((const uint8_t*)disc.data(), (uint32_t)disc.size());
+    return SYS_WriteSave(SaveName(package).c_str(), stream);
+#endif
+}
+
+std::string ReadChosenDisc(const std::string& package)
+{
+#if EDITOR
+    return RecompUtil::ReadText(SavePath(package));
+#else
+    Stream stream;
+    if (!SYS_DoesSaveExist(SaveName(package).c_str()) || !SYS_ReadSave(SaveName(package).c_str(), stream))
+    {
+        return std::string();
+    }
+    return std::string(stream.GetData(), stream.GetSize());
+#endif
+}
+
+void DeleteChosenDisc(const std::string& package)
+{
+#if EDITOR
+    remove(SavePath(package).c_str());
+#else
+    if (SYS_DoesSaveExist(SaveName(package).c_str())) SYS_DeleteSave(SaveName(package).c_str());
+#endif
 }
 
 // ---- one game ------------------------------------------------------------------------------
@@ -248,11 +299,10 @@ public:
     {
         std::string resolved;
         if (!Ps1Launcher::CheckDisc(GamePackage(), path, message, resolved)) return false;
-        std::ofstream file(SavePath(GamePackage()), std::ios::binary | std::ios::trunc);
-        file << resolved;
-        if (!file.good())
+        std::string where;
+        if (!WriteChosenDisc(GamePackage(), resolved, where))
         {
-            message = "Could not remember the disc (cannot write " + SavePath(GamePackage()) + ")";
+            message = "Could not remember the disc (cannot write " + where + ")";
             return false;
         }
         return true;
@@ -260,7 +310,7 @@ public:
 
     std::string GetRomLocation() override { return Ps1Launcher::ChosenDisc(GamePackage()); }
 
-    void ClearRomLocation() override { remove(SavePath(GamePackage()).c_str()); }
+    void ClearRomLocation() override { DeleteChosenDisc(GamePackage()); }
 
     // the disc extracted into the package (development builds, or a game that ships it)
     bool HasShippedData() override
@@ -326,7 +376,7 @@ void Ps1Launcher::UnregisterAll()
 
 std::string Ps1Launcher::ChosenDisc(const std::string& package)
 {
-    std::string text = RecompUtil::ReadText(SavePath(package));
+    std::string text = ReadChosenDisc(package);
     while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) text.pop_back();
     return text;
 }
