@@ -62,6 +62,12 @@ std::jmp_buf sExitJump;
 std::string sSaveDir;
 
 volatile uint32_t sVblank = 0;
+// The game's vblanks: one per wait, so that the host's coming several at once (an editor below
+// 60 fps adds two or more per frame) still reach the game one at a time, as the PS1's do - a game
+// that waits for "a vblank since the last frame" runs a frame for each. It keeps within
+// kMaxVblankLag of the host's: a game slower than the clock sees the time it missed.
+volatile uint32_t sGuestVblank = 0;
+constexpr uint32_t kMaxVblankLag = 4;
 volatile uint32_t sPad = 0;
 std::string sOptions;
 
@@ -396,23 +402,26 @@ extern "C" unsigned port_wait_vblank(void)
     {
         CheckStop();
         sExtraVblanks = sExtraVblanks + 1;
-        return sVblank + sExtraVblanks;
+        return sGuestVblank + sExtraVblanks;
     }
 
-    uint32_t seen = sVblank;
-
-    while (sVblank == seen)
+    if (sVblank - sGuestVblank > kMaxVblankLag)
+    {
+        sGuestVblank = sVblank - kMaxVblankLag;
+    }
+    while (sVblank == sGuestVblank)
     {
         CheckStop();
         SleepBriefly();
     }
-    return sVblank + sExtraVblanks;
+    sGuestVblank = sGuestVblank + 1;
+    return sGuestVblank + sExtraVblanks;
 }
 
 extern "C" unsigned port_vblank_count(void)
 {
     CheckStop();
-    return sVblank + sExtraVblanks;
+    return sGuestVblank + sExtraVblanks;
 }
 
 extern "C" int port_speed(void)
@@ -663,6 +672,7 @@ bool Ps1GuestHost::Start(const Ps1wModule* module, const std::string& discPath, 
 
     sStopRequested = false;
     sVblank = 0;
+    sGuestVblank = 0;
     sSpeed = 1;
     sExtraVblanks = 0;
     sFastWaits = 0;
