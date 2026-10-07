@@ -229,7 +229,32 @@ extern "C" void ps1r_set_data_dir(const char *dir)
     sDataDir = dir != nullptr ? dir : "";
 }
 
+static int live_load();
+
+// N64Recomp prints its notes ("[Info] ...") to stdout and stderr through fmt, which throws when
+// a write fails - as it does in a packaged game, a program with no console: those streams go to
+// NUL there. Anything the recompiler throws ends the load (logged), not the program.
 extern "C" int ps1r_live_load(void)
+{
+#if defined(_WIN32)
+    if (_fileno(stdout) < 0) freopen("NUL", "w", stdout);
+    if (_fileno(stderr) < 0) freopen("NUL", "w", stderr);
+#endif
+    try
+    {
+        return live_load();
+    }
+    catch (const std::exception &e)
+    {
+        return fail(std::string("the recompiler stopped: ") + e.what());
+    }
+    catch (...)
+    {
+        return fail("the recompiler stopped (an exception)");
+    }
+}
+
+static int live_load()
 {
     const auto start = std::chrono::steady_clock::now();
     if (const char *env = getenv("PS1_RECOMP_DIR")) sDataDir = env;
