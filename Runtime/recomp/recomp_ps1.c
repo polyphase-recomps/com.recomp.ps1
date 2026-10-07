@@ -45,6 +45,7 @@ extern void (*ps1w_disc_read_hook)(uint32_t lba, uint32_t count, uint32_t dst);
 const SectionTableEntry *ps1r_section_table(size_t *count);
 const char *ps1r_section_file(unsigned index);
 unsigned ps1r_section_file_count(void);
+void ps1r_mods_reset(void); /* ps1_mod_hooks.c (ps1_mods.py) */
 #ifdef PS1R_LIVE
 int ps1r_live_load(void); /* 0 on failure (logged) */
 void ps1r_set_data_dir(const char *dir);
@@ -240,6 +241,28 @@ static uint64_t callback_trampoline(void *instance, uint32_t a0, uint32_t a1, ui
     ctx.r7 = (gpr)(int32_t)a3;
     ctx.r31 = 0;
     get_function((int32_t)target)(ps1r_mem, &ctx);
+    return (uint32_t)ctx.r2;
+}
+
+/* Mod code (ps1_mods.py: ps1_game_calls.c) calling a game function: o32 arguments, on the
+ * stack of the game code it was called from (a hook, or a library call) */
+uint32_t ps1r_call_game(uint32_t vram, int nargs, const uint32_t *args)
+{
+    uint8_t *const rdram = ps1r_mem; /* (MEM_W) */
+    recomp_context ctx;
+    int i;
+
+    if (sDepth > 0 && sDepth <= MAX_DEPTH) ctx = *sCallers[sDepth - 1];
+    else fatal("mod code called %08X outside the game", vram);
+    /* a frame of its own below the caller's: the arguments past a3 at sp + 16 */
+    ctx.r29 = (gpr)(int32_t)(((uint32_t)ctx.r29 - 16u - 4u * (uint32_t)(nargs > 4 ? nargs : 4) - 8u) & ~7u);
+    for (i = 0; i < nargs; i++)
+    {
+        if (i < 4) (&ctx.r4)[i] = (gpr)(int32_t)args[i];
+        else MEM_W(16 + 4 * (i - 4), ctx.r29) = (int32_t)args[i];
+    }
+    ctx.r31 = 0;
+    get_function((int32_t)vram)(ps1r_mem, &ctx);
     return (uint32_t)ctx.r2;
 }
 
@@ -459,6 +482,7 @@ static void run(void)
 #endif
     sections_init();
     memset(sJmp, 0, sizeof(sJmp));
+    ps1r_mods_reset();
     read_system_cnf(exe, sizeof(exe), &stack);
     if (!port_disc_find(exe, &lba, &size) || !port_disc_read(lba, 1, header)) fatal("cannot read %s", exe);
     pc0 = rd32(header + 0x10);

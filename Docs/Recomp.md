@@ -105,9 +105,62 @@ powershell -File Packages/com.recomp.ps1/Runtime/tools/recomp/build_recomp.ps1 -
 Then restart the editor (the addon is relinked as it loads).
 
 **Limits:** one recompiled game per editor project (the libraries' symbols are the same for every
-game; other PS1 games in the project stay in Decomp mode). Mods compiled into a decomp build
-(a game package's `Native/game/*.c`, `patches/`) don't exist in Recomp mode; disc file mods
-(`Assets/Disc`), mod settings and the launcher do.
+game; other PS1 games in the project stay in Decomp mode).
+
+## Mods
+
+Mod code is C, as in a decomp build, and runs in Recomp and Recomp (live) alike. A game package's
+`Recomp/mods.toml` lists it and the places in the game's code that call it (hooks):
+
+```toml
+sources = ["../Native/game/bridge.c", "mods.c"]   # compiled into the libraries' module
+
+[[hook]]
+func = "gameLoop"          # a game function (a name in syms.toml)
+at = 0x800EFB70            # before this instruction (not a branch's delay slot)
+call = "dw_bridge_tick"    # a mod function
+
+[[hook]]
+func = "MAIN_func_800FFDF4"
+at = 0x800FFE34
+call = "dwr_pressed_or_skipping"
+args = ["v0"]              # registers passed to it (32-bit integers), in order
+result = "v0"              # register set to what it returns
+
+[[hook]]
+func = "damageTick"
+entry = true               # at the start of the function
+call = "dw_cheat_damage_tick"
+args = ["a0", "a1"]
+return_if = "nonzero"      # the game function returns right away when the call gives nonzero
+                           # ("nonnegative": >= 0), with `result` set when there is one
+
+[[hook]]
+func = "BTL_calculateDamage"
+after = true               # once the function has returned: args name its registers at the
+call = "dw_cheat_damage"   # start (a0-a3), "v0" / "v1" what it returned
+args = ["a0", "a1", "v0"]
+result = "v0"
+```
+
+- **What mod code sees:** it is compiled into the runtime's library module with the game's
+  headers (`ps1_recomp_game(... MODS MOD_INCLUDES MOD_DEFINES)`), so the game's globals are at
+  their addresses (`extern int32_t MONEY;` works).
+- **Calling the game:** a call to a game function by name runs the recompiled one (o32
+  arguments; the module imports it). The script bridge (`port_bridge.h`, Lua `Ps1.*`), options
+  (`port_debug_values`, game.json "options") and the rest of `port_host.h` work as in a decomp
+  build.
+- **Hooks:** they go into N64Recomp's output (`[[patches.hook]]`) and into the live
+  recompiler's code. A decomp build's patch that does more than a plain call is written as a
+  hook on the registers or globals at that point (`com.recomp.digimonworld/Recomp/mods.c`).
+- **Tooling:** `Runtime/tools/recomp/ps1_mods.py` checks the file (functions, addresses,
+  argument counts) and writes the glue. An address must be in the named function.
+
+Finding a place: the decomp's C for the patch, then the function's code in the exe. A hook
+goes before an instruction, so pick one after a call's delay slot, or a branch whose register
+the hook can set. Digimon World's four mod patches are 22 hooks (`Recomp/mods.toml`); the same
+headless scripts give the same frames with the mods on as the decomp build does (hold-to-skip,
+pause menu, game pause, cheats).
 
 ## Launcher
 
@@ -130,4 +183,10 @@ For a live build, `PS1_RECOMP_DIR=<folder with game.json and syms.toml>` gives t
 World (2026-10-06): 4204 functions; Recomp, Recomp (live) and the extracted-disc run all give
 frames identical to each other over 20000 frames of title, new game, memory card save, name
 entry, the intro movie and the field. Against the decomp port they match from the field on (the
-port patches its own movie player in).
+port patches its own movie player in), with and without the mods.
+
+Not yet the same: a battle (`--debug-warp 20,0,17200 --debug-battle 2,17400`). Both builds
+reach it with the same random number state, and the first enemy hit (frame ~17830) lands in
+the decomp port and not in the recompiled game. Which is the original's behaviour needs a third
+reference (an emulator); the decomp port is C compiled for another machine, the recomp the
+original code.

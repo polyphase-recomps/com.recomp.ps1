@@ -52,6 +52,16 @@ uint32_t ps1_gte_read_data(recomp_context *ctx, int reg);
 void ps1_gte_write_data(recomp_context *ctx, int reg, uint32_t value);
 uint32_t ps1_gte_read_ctrl(recomp_context *ctx, int reg);
 void ps1_gte_write_ctrl(recomp_context *ctx, int reg, uint32_t value);
+/* the mods' hooks (ps1_mods.py: ps1_mod_hooks.c) */
+typedef struct
+{
+    const char *func;
+    uint32_t vram; /* 0: the function's entry */
+    const char *text;
+    int (*fn)(uint8_t *, recomp_context *);
+} Ps1rModHook;
+extern const Ps1rModHook ps1r_mod_hooks[];
+extern const unsigned ps1r_mod_hook_count;
 }
 
 #ifndef PS1R_DATA_DIR
@@ -280,6 +290,27 @@ extern "C" int ps1r_live_load(void)
     }
     context.ps1 = true;
 
+    // the mods' hooks, as N64Recomp's [[patches.hook]] (the C output has them from the config)
+    std::unordered_map<std::string, int (*)(uint8_t *, recomp_context *)> text_hooks;
+    for (unsigned i = 0; i < ps1r_mod_hook_count; i++)
+    {
+        const Ps1rModHook &hook = ps1r_mod_hooks[i];
+        auto found = context.functions_by_name.find(hook.func);
+        if (found == context.functions_by_name.end()) return fail(std::string("a mod hooks ") + hook.func + ", which the symbols don't have");
+        N64Recomp::Function &func = context.functions[found->second];
+        int32_t index = -1;
+        if (hook.vram != 0)
+        {
+            if (hook.vram < func.vram || hook.vram >= func.vram + func.words.size() * 4) return fail(std::string("a mod hook is outside ") + hook.func);
+            index = (int32_t)((hook.vram - func.vram) / 4);
+        }
+        func.function_hooks[index] = hook.text;
+        std::string name(hook.text);
+        if (name.rfind("if (", 0) == 0) name = name.substr(4);
+        name = name.substr(0, name.find('('));
+        text_hooks[name] = hook.fn;
+    }
+
     N64Recomp::live_recompiler_init();
     N64Recomp::LiveGeneratorInputs inputs{};
     inputs.cop0_status_write = cop0_status_write;
@@ -302,6 +333,7 @@ extern "C" int ps1r_live_load(void)
     inputs.ps1_setjmp_begin = reinterpret_cast<void *(*)(uint8_t *, recomp_context *)>(ps1_setjmp_begin);
     inputs.ps1_setjmp_fn = reinterpret_cast<void *>(&_setjmp);
     inputs.ps1_setjmp_resume = ps1_setjmp_resume;
+    inputs.text_hooks = std::move(text_hooks);
     if (!compile(context, inputs, game->output)) return 0;
 
     // the section table the runtime looks functions up in (as recomp_overlays.inl has it)

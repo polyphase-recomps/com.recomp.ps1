@@ -47,6 +47,10 @@ of the snapshot with `git diff --no-index`, paths rewritten to `ThirdParty/N64Re
   - LiveRecomp: the same hooks through `LiveGeneratorInputs`; loads and stores go through the
     runtime's address folding (`ps1_fold`) with no byte swizzle; `lwl/lwr/swl/swr` are
     little-endian; `rdram_offset` is per generator.
+  - `[[patches.hook]]` in LiveRecomp too (`Generator::emit_text_hook`, `text_hooks`): the hook's
+    text names a host function, called with (rdram, ctx); `if (name(rdram, ctx)) return;`
+    returns from the hooked function when it gives nonzero. The C output keeps the text as
+    upstream does. The mods use them (`Runtime/tools/recomp/ps1_mods.py`).
 - **com.recomp.n64's LiveRecomp hooks** (`external_functions`, `loop_budget` / `loop_preempt`),
   which the snapshot was copied with.
 

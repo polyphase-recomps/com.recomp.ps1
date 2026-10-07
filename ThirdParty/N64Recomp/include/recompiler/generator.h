@@ -74,10 +74,13 @@ namespace N64Recomp {
         virtual bool emit_ps1_rfe() const { return false; }
         // div / divu with the R3000's results for a zero divisor (never a host exception).
         virtual bool emit_ps1_div(bool is_signed, int reg1, int reg2) const { (void)is_signed; (void)reg1; (void)reg2; return false; }
+        // com.recomp.ps1: a [[patches.hook]] (its text goes into C output as is). False: print the text.
+        virtual bool emit_text_hook(const Context& context, size_t func_index, const std::string& text) const { (void)context; (void)func_index; (void)text; return false; }
     };
 
     class CGenerator final : Generator {
     public:
+        using Generator::emit_text_hook; // com.recomp.ps1: hooks stay text in C output
         CGenerator(std::ostream& output_file) : output_file(output_file) {};
         void process_binary_op(const BinaryOp& op, const InstructionContext& ctx) const final;
         void process_unary_op(const UnaryOp& op, const InstructionContext& ctx) const final;

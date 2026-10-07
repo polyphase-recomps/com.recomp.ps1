@@ -8,7 +8,8 @@
 # The game package provides Recomp\: game.json (title, name, config, rom: the boot executable's
 # file name and sha1, the disc image's usual name), the N64Recomp config it names, the symbols
 # (syms.toml, psyq.txt, data_symbols.txt: tools/recomp/ps1_syms.py) and CMakeLists.txt calling
-# ps1_recomp_game (Runtime/cmake/Ps1Recomp.cmake). The disc: -Disc, else the package's
+# ps1_recomp_game (Runtime/cmake/Ps1Recomp.cmake), and optionally mods.toml (the mods' code and
+# hooks: tools/recomp/ps1_mods.py, Docs/Recomp.md). The disc: -Disc, else the package's
 # Assets\game.json "disc", else the extracted Assets\Disc. Steps, each skipped when up to date:
 #   1. the recompiler's input from the disc (ps1_rom.py: rom.bin, section_files.c) -> <game>\Native\build\recomp
 #   2. N64Recomp.exe from the vendored source (ThirdParty\N64Recomp)           -> Runtime\build\n64recomp
@@ -201,13 +202,14 @@ if ($LASTEXITCODE -ne 0) { throw "this disc is not the one $($game.title)'s symb
 # 2. N64Recomp
 $rcBuild = Join-Path $ps1 'Runtime\build\n64recomp'
 $rcExe = Join-Path $rcBuild 'N64Recomp.exe'
-if (-not (Test-Path $rcExe)) {
-    Write-Host 'building N64Recomp (once)'
+if (-not (Test-Path (Join-Path $rcBuild 'CMakeCache.txt'))) {
+    Write-Host 'building N64Recomp'
     & $cmake -S (Join-Path $ps1 'ThirdParty\N64Recomp') -B $rcBuild -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" `
         "-DCMAKE_C_COMPILER=$llvm\clang-cl.exe" "-DCMAKE_CXX_COMPILER=$llvm\clang-cl.exe" -DCMAKE_BUILD_TYPE=Release | Out-Null
-    & $cmake --build $rcBuild --target N64RecompCLI
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $rcExe)) { throw 'building N64Recomp failed' }
 }
+# (up to date in a moment when ThirdParty\N64Recomp didn't change)
+$rcLog = & $cmake --build $rcBuild --target N64RecompCLI 2>&1
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $rcExe)) { $rcLog | Write-Host; throw 'building N64Recomp failed' }
 
 # 3. The C: the game's config with its paths made absolute, this rom and this output folder
 $rom = Join-Path $outDir 'rom.bin'
@@ -222,6 +224,14 @@ $lines = foreach ($line in Get-Content $toml) {
 }
 $genToml = Join-Path $outDir 'recomp.gen.toml'
 $text = ($lines -join "`n") + "`n"
+# the mods' hooks (Recomp\mods.toml) go into the generated code
+$modsToml = Join-Path $recompDir 'mods.toml'
+if (Test-Path $modsToml) {
+    $hooksFile = Join-Path $outDir 'mods.hooks.toml'
+    & $python -u (Join-Path $tools 'recomp\ps1_mods.py') hooks $modsToml $syms $hooksFile
+    if ($LASTEXITCODE -ne 0) { throw 'Recomp\mods.toml has errors (see above)' }
+    $text += (Get-Content $hooksFile -Raw)
+}
 if (-not (Test-Path $genToml) -or (Get-Content $genToml -Raw) -ne $text) { Set-Content -Path $genToml -Value $text -NoNewline }
 $stamp = Join-Path $outDir 'funcs.stamp'
 $inputs = @($genToml, $rom, $rcExe, $syms)

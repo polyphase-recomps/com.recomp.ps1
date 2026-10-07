@@ -130,7 +130,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
     };
 
     auto hook_find = func.function_hooks.find(instr_index);
-    if (hook_find != func.function_hooks.end()) {
+    if (hook_find != func.function_hooks.end() && !generator.emit_text_hook(context, func_index, hook_find->second)) {
         fmt::print(output_file, "    {}\n", hook_find->second);
         if (indent) {
             print_indent();
@@ -847,7 +847,7 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
         instructions.reserve(func.words.size());
 
         auto hook_find = func.function_hooks.find(-1);
-        if (hook_find != func.function_hooks.end()) {
+        if (hook_find != func.function_hooks.end() && !generator.emit_text_hook(context, func_index, hook_find->second)) {
             fmt::print(output_file, "    {}\n", hook_find->second);
         }
 

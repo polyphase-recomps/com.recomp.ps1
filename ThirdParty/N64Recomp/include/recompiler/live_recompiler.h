@@ -112,6 +112,10 @@ namespace N64Recomp {
         void* (*ps1_setjmp_begin)(uint8_t* rdram, recomp_context* ctx) = nullptr;
         void* ps1_setjmp_fn = nullptr;
         void (*ps1_setjmp_resume)(uint8_t* rdram, recomp_context* ctx, int value) = nullptr;
+        // com.recomp.ps1: [[patches.hook]] texts, which in C output call a host function -
+        // "name(rdram, ctx);", or "if (name(rdram, ctx)) return;" to return from the hooked
+        // function when it gives nonzero - by the name in the text.
+        std::unordered_map<std::string, int (*)(uint8_t* rdram, recomp_context* ctx)> text_hooks;
     };
     class LiveGenerator final : public Generator {
     public:
@@ -162,6 +166,7 @@ namespace N64Recomp {
         bool emit_ps1_cop0_move(bool to_gpr, int gpr, int cop0_reg) const final;
         bool emit_ps1_rfe() const final;
         bool emit_ps1_div(bool is_signed, int reg1, int reg2) const final;
+        bool emit_text_hook(const Context& context, size_t func_index, const std::string& text) const final;
     private:
         // com.recomp.ps1: folds the guest address in `reg` onto the memory buffer
         void ps1_fold(int reg, int scratch) const;

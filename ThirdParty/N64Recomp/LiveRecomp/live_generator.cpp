@@ -1,4 +1,5 @@
 #include <cassert>
+#include <cctype>
 #include <fstream>
 #include <unordered_map>
 #include <cmath>
@@ -1740,6 +1741,45 @@ void N64Recomp::LiveGenerator::emit_return(const Context& context, size_t func_i
         sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS3V(P, P, W), SLJIT_IMM, sljit_sw(inputs.run_hook));
     }
     sljit_emit_return_void(compiler);
+}
+
+bool N64Recomp::LiveGenerator::emit_text_hook(const Context& context, size_t func_index, const std::string& text) const {
+    // com.recomp.ps1: the host function the hook's text calls (see LiveGeneratorInputs::text_hooks)
+    std::string name;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t end = pos;
+        while (end < text.size() && (std::isalnum((unsigned char)text[end]) || text[end] == '_')) {
+            end++;
+        }
+        if (end > pos) {
+            std::string word = text.substr(pos, end - pos);
+            if (word != "if") {
+                name = word;
+                break;
+            }
+            pos = end;
+        }
+        else {
+            pos++;
+        }
+    }
+    auto find_it = inputs.text_hooks.find(name);
+    if (find_it == inputs.text_hooks.end()) {
+        fmt::print(stderr, "No host function for the hook \"{}\" in {}\n", text, context.functions[func_index].name);
+        errored = true;
+        return true;
+    }
+    sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
+    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
+    sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2(32, P, P), SLJIT_IMM, sljit_sw(find_it->second));
+    if (text.find("return") != std::string::npos) {
+        // nonzero: the hooked function returns now
+        sljit_jump* go_on = sljit_emit_cmp(compiler, SLJIT_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, 0);
+        emit_return(context, func_index);
+        sljit_set_label(go_on, sljit_emit_label(compiler));
+    }
+    return true;
 }
 
 void N64Recomp::LiveGenerator::emit_check_fr(int fpr) const {

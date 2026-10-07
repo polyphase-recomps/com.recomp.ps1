@@ -7,6 +7,7 @@
 #                   SYMS <the game's Recomp folder: syms.toml, psyq.txt, data_symbols.txt, game.json>
 #                   [SECTION_FILES <ps1_rom.py's section_files.c> (default SYMS/section_files.c)]
 #                   INCLUDES <PsyQ SDK headers (psyq_headers/.../include)>
+#                   [MODS <Recomp/mods.toml> MOD_INCLUDES <dirs> MOD_DEFINES <NAME[=value]>]
 #                   [DISC <default disc image>])
 #
 # Makes <name>_recomp_game (a static library: the game as a Ps1wModule, ps1w_module_<name>_recomp,
@@ -26,6 +27,9 @@
 # game.json (SYMS, or ps1r_set_data_dir / PS1_RECOMP_DIR). It holds no game code. The library
 # for the addon is then <name>_recomp_all: the game library and the recompiler's merged.
 #
+# MODS: mod code compiled into the libraries' module with the game's headers (MOD_INCLUDES,
+# MOD_DEFINES), hooked into the recompiled code (tools/recomp/ps1_mods.py, ../Docs/Recomp.md).
+#
 # Every global of the library is the same for every game ("ps1hle", "ps1r_"): one recompiled
 # game per editor project (other PS1 games there build in Decomp mode).
 cmake_minimum_required(VERSION 3.20)
@@ -35,7 +39,7 @@ option(PS1_RECOMP_LIVE "recompile the game at boot (LiveRecomp) instead of build
 set(PS1_N64RECOMP_DIR "${CMAKE_CURRENT_LIST_DIR}/../../ThirdParty/N64Recomp" CACHE PATH "com.recomp.ps1's N64Recomp")
 
 function(ps1_recomp_game)
-    cmake_parse_arguments(G "" "NAME;TITLE;PACKAGE;GENERATED;SYMS;SECTION_FILES;DISC;RAM_SIZE" "INCLUDES" ${ARGN})
+    cmake_parse_arguments(G "" "NAME;TITLE;PACKAGE;GENERATED;SYMS;SECTION_FILES;DISC;RAM_SIZE;MODS" "INCLUDES;MOD_INCLUDES;MOD_DEFINES" ${ARGN})
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     set(PY "${Python3_EXECUTABLE}")
     set(PORT_DIR "${PS1_RUNTIME_DIR}/port")
@@ -107,6 +111,38 @@ function(ps1_recomp_game)
             DEPENDS "${src}" DEPFILE "${obj}.d" COMMENT "wasm ${stem}.c" VERBATIM)
         list(APPEND objs "${obj}")
     endforeach()
+    # ---- the mods: their code in the same module, with the game's headers
+    set(mods_toml "")
+    if(G_MODS)
+        get_filename_component(mods_toml "${G_MODS}" ABSOLUTE)
+        execute_process(COMMAND "${PY}" "${TOOLS}/recomp/ps1_mods.py" sources "${mods_toml}"
+            OUTPUT_VARIABLE mod_sources RESULT_VARIABLE rc OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(NOT rc EQUAL 0)
+            message(FATAL_ERROR "ps1_recomp_game: ${G_MODS}: ${mod_sources}")
+        endif()
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mods_toml}")
+        string(REPLACE "\n" ";" mod_sources "${mod_sources}")
+        set(mod_cflags ${cflags} -DPS1_RECOMP=1)
+        foreach(i IN LISTS G_MOD_INCLUDES)
+            list(APPEND mod_cflags -I "${i}")
+        endforeach()
+        foreach(d IN LISTS G_MOD_DEFINES)
+            list(APPEND mod_cflags "-D${d}")
+        endforeach()
+        foreach(src IN LISTS mod_sources)
+            get_filename_component(stem "${src}" NAME_WE)
+            set(obj "${HLE_DIR}/obj/mod_${stem}.o")
+            add_custom_command(OUTPUT "${obj}"
+                COMMAND "${WASM_CC}" ${mod_cflags} -MD -MF "${obj}.d" -c "${src}" -o "${obj}"
+                DEPENDS "${src}" DEPFILE "${obj}.d" COMMENT "wasm mod ${stem}.c" VERBATIM)
+            list(APPEND objs "${obj}")
+        endforeach()
+    endif()
+    # the module's imports: the host's, and game functions mod code may call (ps1_game_calls.c
+    # runs them) - one file: wasm-ld reads only the last --allow-undefined-file
+    add_custom_command(OUTPUT "${HLE_DIR}/imports.txt"
+        COMMAND "${PY}" "${TOOLS}/recomp/ps1_mods.py" imports "${G_SYMS}/syms.toml" "${TOOLS}/wasm_imports.txt" "${HLE_DIR}/imports.txt"
+        DEPENDS "${G_SYMS}/syms.toml" "${TOOLS}/wasm_imports.txt" "${TOOLS}/recomp/ps1_mods.py" VERBATIM)
     # PS1 RAM first, as a placeholder with the game's data symbols at their addresses (the
     # libraries use PsyQ's globals where the game has them); the libraries' own data, stack
     # and heap follow, up to PS1W_HEAP_END - the layout of a wasm game build.
@@ -124,10 +160,10 @@ function(ps1_recomp_game)
         COMMAND "${PY}" "${TOOLS}/wasm_link.py" "${WASM_LD}" --no-entry --export-all
             --no-stack-first -z stack-size=524288 --global-base=2147483648
             --initial-memory=2155806720 --max-memory=2155806720
-            "--allow-undefined-file=${TOOLS}/wasm_imports.txt" --error-limit=0
+            "--allow-undefined-file=${HLE_DIR}/imports.txt" --error-limit=0
             "${sym_obj}" ${objs} "${WASI_LIB}/libsetjmp.a" "${WASI_LIB}/libc.a" ${WASM_RT_BUILTINS}
             -o "${wasm}"
-        DEPENDS "${sym_obj}" ${objs} "${TOOLS}/wasm_imports.txt" "${TOOLS}/wasm_link.py"
+        DEPENDS "${sym_obj}" ${objs} "${HLE_DIR}/imports.txt" "${TOOLS}/wasm_link.py"
         COMMENT "wasm-ld ps1hle.wasm" VERBATIM)
     set(w2c_count 4)
     set(w2c_c "")
@@ -146,6 +182,12 @@ function(ps1_recomp_game)
         COMMAND "${PY}" "${TOOLS}/recomp/gen_hle_wrappers.py" "${HLE_DIR}/ps1hle_guest.h" "${G_SYMS}/psyq.txt" "${HLE_DIR}"
         DEPENDS "${HLE_DIR}/ps1hle_guest.h" "${G_SYMS}/psyq.txt" "${TOOLS}/recomp/gen_hle_wrappers.py"
         COMMENT "PsyQ wrappers" VERBATIM)
+    # the mods' hooks and calls into the game (empty without MODS)
+    set(mod_glue "${HLE_DIR}/ps1_mod_hooks.c" "${HLE_DIR}/ps1_game_calls.c")
+    add_custom_command(OUTPUT ${mod_glue} "${HLE_DIR}/ps1_mod_hooks.h"
+        COMMAND "${PY}" "${TOOLS}/recomp/ps1_mods.py" glue "${mods_toml}" "${G_SYMS}/syms.toml" "${HLE_DIR}/ps1hle_guest.h" "${HLE_DIR}"
+        DEPENDS "${HLE_DIR}/ps1hle_guest.h" "${G_SYMS}/syms.toml" "${TOOLS}/recomp/ps1_mods.py" ${mods_toml}
+        COMMENT "mod hooks" VERBATIM)
 
     # ---- the program --------------------------------------------------------------------------
     if(PS1_RECOMP_LIVE)
@@ -165,7 +207,7 @@ function(ps1_recomp_game)
     file(COPY_FILE "${GEN_DIR}/ps1w_default_module.c.new" "${GEN_DIR}/ps1w_default_module.c" ONLY_IF_DIFFERENT)
     # the game: everything but the host (the addon has its own: Source/Wasm, Ps1GuestHost)
     set(target ${G_NAME}_recomp_game)
-    add_library(${target} STATIC ${w2c_c} "${HLE_DIR}/ps1_hle_wrappers.c"
+    add_library(${target} STATIC ${w2c_c} "${HLE_DIR}/ps1_hle_wrappers.c" ${mod_glue}
         "${RECOMP_DIR}/recomp_ps1.c" "${RECOMP_DIR}/recomp_libc.c" ${game_sources})
     target_include_directories(${target} PRIVATE "${G_GENERATED}" "${RECOMP_DIR}/include" "${HLE_DIR}"
         "${PORT_DIR}/include" "${GEN_DIR}" "${SOURCE_WASM_DIR}")
@@ -186,8 +228,8 @@ function(ps1_recomp_game)
     # the game's calls to PsyQ functions (by name) need their declarations
     if(generated_c)
         set_source_files_properties(${generated_c} PROPERTIES
-            COMPILE_OPTIONS "-fno-strict-aliasing;-include;${HLE_DIR}/ps1_hle_decls.h"
-            OBJECT_DEPENDS "${HLE_DIR}/ps1_hle_decls.h")
+            COMPILE_OPTIONS "-fno-strict-aliasing;-include;${HLE_DIR}/ps1_hle_decls.h;-include;${HLE_DIR}/ps1_mod_hooks.h"
+            OBJECT_DEPENDS "${HLE_DIR}/ps1_hle_decls.h;${HLE_DIR}/ps1_mod_hooks.h")
     endif()
     if(PS1_RECOMP_LIVE)
         target_compile_definitions(${target} PRIVATE PS1R_LIVE=1 "PS1R_DATA_DIR=\"${G_SYMS}\"")
