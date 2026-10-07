@@ -71,8 +71,8 @@ enum : unsigned int
 // Input diagnostics: logs every change of the controller state at three levels so a
 // run on hardware shows where a press gets lost -- the raw Wii Remote (WPAD, Wii
 // builds), the engine's gamepads, and the PS1 pad bits handed to the game -- plus a
-// status line every 5 seconds while nothing changes.
-static const bool kLogInput = true;
+// status line every 5 seconds while nothing changes. Off: turn it on to debug a pad.
+static const bool kLogInput = false;
 
 static void AppendNames(std::string& out, uint32_t mask, const char* const* names, uint32_t count)
 {
