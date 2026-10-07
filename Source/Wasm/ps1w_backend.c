@@ -140,6 +140,9 @@ void w2c_env_port_host_fatal(struct w2c_env *env, u32 msg)
 /* ---- imports: disc ------------------------------------------------------------------ */
 /* Recomp mode: told about every disc read into guest memory (overlays loading). */
 void (*ps1w_disc_read_hook)(u32 lba, u32 count, u32 dst);
+/* a module with threads of its own (recomp mode's BIOS threads): called before the host leaves
+ * the game with longjmp (stop: 2, crash: 1); it gets back to the thread whose stack that jumps to */
+int (*ps1w_unwind_hook)(int code);
 
 u32 w2c_env_port_disc_read(struct w2c_env *env, u32 lba, u32 count, u32 dst)
 {

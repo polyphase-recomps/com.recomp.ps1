@@ -231,6 +231,16 @@ VECTOR *ApplyMatrix(MATRIX *m, SVECTOR *v0, VECTOR *v1)
     return v1;
 }
 
+VECTOR *ApplyRotMatrix(SVECTOR *v0, VECTOR *v1)
+{
+    gte_ldv0(v0);
+    port_gte_op(0x0486012); /* MVMVA sf=1 RT V0, no translation */
+    v1->vx = port_gte_read_data(25);
+    v1->vy = port_gte_read_data(26);
+    v1->vz = port_gte_read_data(27);
+    return v1;
+}
+
 SVECTOR *ApplyMatrixSV(MATRIX *m, SVECTOR *v0, SVECTOR *v1)
 {
     long x = v0->vx, y = v0->vy, z = v0->vz;

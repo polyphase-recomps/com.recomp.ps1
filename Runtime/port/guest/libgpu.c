@@ -6,6 +6,8 @@
 #include <port_host.h>
 
 static int sGraphDebug;
+static DRAWENV sDrawEnv; /* the last PutDrawEnv / PutDispEnv (GetDrawEnv / GetDispEnv) */
+static DISPENV sDispEnv;
 
 int ResetGraph(int mode)
 {
@@ -22,6 +24,23 @@ int SetGraphDebug(int level)
 
     sGraphDebug = level;
     return old;
+}
+
+int GetGraphDebug(void)
+{
+    return sGraphDebug;
+}
+
+/* the GPU's type: 0, the retail console's (1 and 2 are development boards' VRAM layouts) */
+int GetGraphType(void)
+{
+    return 0;
+}
+
+/* interlaced odd/even line: the display is drawn progressively */
+int GetODE(void)
+{
+    return 0;
 }
 
 void SetDispMask(int mask)
@@ -157,16 +176,30 @@ DRAWENV *SetDefDrawEnv(DRAWENV *env, int x, int y, int w, int h)
     return env;
 }
 
+DISPENV *GetDispEnv(DISPENV *env)
+{
+    *env = sDispEnv;
+    return env;
+}
+
+DRAWENV *GetDrawEnv(DRAWENV *env)
+{
+    *env = sDrawEnv;
+    return env;
+}
+
 DISPENV *PutDispEnv(DISPENV *env)
 {
     int h = env->disp.h;
 
+    sDispEnv = *env;
     gpu_set_display(env->disp.x, env->disp.y, env->disp.w, h, env->isrgb24);
     return env;
 }
 
 DRAWENV *PutDrawEnv(DRAWENV *env)
 {
+    sDrawEnv = *env;
     gpu_set_draw_area(env->clip.x, env->clip.y, env->clip.x + env->clip.w - 1, env->clip.y + env->clip.h - 1);
     gpu_set_draw_offset(env->ofs[0], env->ofs[1]);
     gpu_set_texwindow(env->tw.x, env->tw.y, env->tw.w, env->tw.h);
@@ -197,6 +230,57 @@ void SetDrawOffset(DR_OFFSET *p, u_short *ofs)
     p->code[1] = 0;
 }
 
+/* the GPU's draw-mode words (GP0 E1 texpage, E2 texture window, E3/E4 drawing area) */
+static u_long draw_mode_word(int dfe, int dtd, int tpage)
+{
+    return 0xE1000000 | (dtd ? 0x200 : 0) | (dfe ? 0x400 : 0) | ((u_long)tpage & 0x9FF);
+}
+
+static u_long tex_window_word(RECT *tw)
+{
+    if (tw == 0) return 0;
+    return 0xE2000000 | ((u_long)((u_char)tw->y >> 3) << 15) | ((u_long)((u_char)tw->x >> 3) << 10) |
+           ((u_long)((u_char)-tw->h >> 3) << 5) | (u_long)((u_char)-tw->w >> 3);
+}
+
+void SetDrawMode(DR_MODE *p, int dfe, int dtd, int tpage, RECT *tw)
+{
+    setlen(p, 2);
+    p->code[0] = draw_mode_word(dfe, dtd, tpage);
+    p->code[1] = tex_window_word(tw);
+}
+
+void SetDrawTPage(DR_TPAGE *p, int dfe, int dtd, int tpage)
+{
+    setlen(p, 1);
+    p->code[0] = draw_mode_word(dfe, dtd, tpage);
+}
+
+void SetTexWindow(DR_TWIN *p, RECT *tw)
+{
+    setlen(p, 2);
+    p->code[0] = tex_window_word(tw);
+    p->code[1] = 0;
+}
+
+void SetDrawArea(DR_AREA *p, RECT *r)
+{
+    int x1 = r->x + r->w - 1, y1 = r->y + r->h - 1;
+
+    if (x1 > 1023) x1 = 1023;
+    if (y1 > 511) y1 = 511;
+    setlen(p, 2);
+    p->code[0] = 0xE3000000 | (((u_long)r->y & 0x3FF) << 10) | ((u_long)r->x & 0x3FF);
+    p->code[1] = 0xE4000000 | (((u_long)y1 & 0x3FF) << 10) | ((u_long)x1 & 0x3FF);
+}
+
+/* the ordering table's links (a primitive's tag: the next one's address, its length) */
+void *NextPrim(void *p) { return nextPrim(p); }
+int IsEndPrim(void *p) { return isendprim(p); }
+void TermPrim(void *p) { termPrim(p); }
+void CatPrim(void *p0, void *p1) { catPrim(p0, p1); }
+void AddPrims(void *ot, void *p0, void *p1) { addPrims(ot, p0, p1); }
+
 void SetLineF2(LINE_F2 *p) { setLineF2(p); }
 void SetLineF3(LINE_F3 *p) { setLineF3(p); }
 void SetLineF4(LINE_F4 *p) { setLineF4(p); }
@@ -206,6 +290,20 @@ void SetPolyFT4(POLY_FT4 *p) { setPolyFT4(p); }
 void SetPolyG4(POLY_G4 *p) { setPolyG4(p); }
 void SetPolyGT4(POLY_GT4 *p) { setPolyGT4(p); }
 void SetSemiTrans(void *p, int abe) { setSemiTrans(p, abe); }
+void SetShadeTex(void *p, int tge) { setShadeTex(p, tge); }
+void SetPolyF3(POLY_F3 *p) { setPolyF3(p); }
+void SetPolyG3(POLY_G3 *p) { setPolyG3(p); }
+void SetPolyGT3(POLY_GT3 *p) { setPolyGT3(p); }
+void SetLineG2(LINE_G2 *p) { setLineG2(p); }
+void SetLineG3(LINE_G3 *p) { setLineG3(p); }
+void SetLineG4(LINE_G4 *p) { setLineG4(p); }
+void SetSprt(SPRT *p) { setSprt(p); }
+void SetSprt8(SPRT_8 *p) { setSprt8(p); }
+void SetSprt16(SPRT_16 *p) { setSprt16(p); }
+void SetTile(TILE *p) { setTile(p); }
+void SetTile1(TILE_1 *p) { setTile1(p); }
+void SetTile8(TILE_8 *p) { setTile8(p); }
+void SetTile16(TILE_16 *p) { setTile16(p); }
 
 /* ---- TIM ------------------------------------------------------------------------------- */
 static u_long *sTimCursor;

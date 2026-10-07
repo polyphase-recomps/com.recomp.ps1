@@ -79,6 +79,13 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
         }
         // Otherwise, create a static function at the target address.
         else {
+            // com.recomp.ps1: the symbols (ps1_syms.py) already start a function at every call
+            // target that is code; a call to anything else is one overlay calling another's
+            // function at an address they share (here the middle of a function, or data): it is
+            // looked up when it runs
+            if (context.ps1) {
+                return JalResolutionResult::Ambiguous;
+            }
             return JalResolutionResult::CreateStatic;
         }
     }
@@ -87,6 +94,11 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
         // If there were no matches then JAL resolution has failed.
         // A static can't be created as the target section is unknown.
         if (matched_funcs.size() == 0) {
+            // com.recomp.ps1: a call into another file's address space that no known function
+            // starts at (an overlay region several files share) is looked up when it runs
+            if (context.ps1) {
+                return JalResolutionResult::Ambiguous;
+            }
             return JalResolutionResult::NoMatch;
         }
         // If there was an exact match, use it.

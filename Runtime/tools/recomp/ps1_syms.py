@@ -13,10 +13,10 @@ overlay files, taken from the player's disc), makes what N64Recomp (PS1 mode) re
   <out>/psyq.txt    the PsyQ library functions (the runtime implements them; see
                     runtime/recomp/ps1_hle_funcs.h)
 
-Functions are the symbols that fall inside a file's code (splat `c` / `asm` subsegments of
-`code` segments); each runs up to the next one, or to the end of the code. Code that only
-calls reveal (static functions) N64Recomp finds itself. PsyQ library functions (`asm`
-subsegments named psyq/...) are listed as <name>_recomp with size 0: never recompiled,
+Functions are the symbols that fall inside a file's code (splat `c` / `asm` / `hasm`
+subsegments of `code` segments); each runs up to the next one, or to the end of the code.
+Code that only calls reveal (static functions) N64Recomp finds itself. PsyQ library code
+(subsegments named psyq/...) is listed as <name>_recomp with size 0: never recompiled,
 called by name, implemented by the runtime.
 
     python ps1_syms.py --decomp <dw_decomp> --disc-dir <folder with the disc's files> --out <dir>
@@ -24,6 +24,10 @@ called by name, implemented by the runtime.
 
 The first --file is the boot executable (PS-X EXE). The ROM layout (file order, 2048-byte
 alignment) is what the runtime rebuilds from the player's disc in live mode.
+
+A game the decomp names only partly: --scan finds the functions nobody named (ps1_scan.py),
+and an overlay with no splat config is --file NAME@0xVRAM (the address the game loads it at):
+all of it is scanned, its code ends where the scan does.
 """
 import argparse
 import os
@@ -89,7 +93,7 @@ def code_ranges(config):
             name = str(sub[2]) if len(sub) > 2 else ""
             end = subs[j + 1][0] if j + 1 < len(subs) and isinstance(subs[j + 1], list) else seg_end
             if kind in CODE_TYPES and end is not None and end > start:
-                ranges.append((start + seg_delta, end + seg_delta, kind == "asm" and name.startswith("psyq/")))
+                ranges.append((start + seg_delta, end + seg_delta, name.startswith("psyq/")))
     return ranges, delta
 
 
@@ -128,13 +132,154 @@ def jal_targets(data, delta, ranges):
     return out
 
 
+# BIOS functions by table (A0 / B0 / C0) and number: what PsyQ's call stubs reach
+BIOS = {
+    0xA0: {0x13: "setjmp", 0x14: "longjmp", 0x33: "malloc", 0x34: "free", 0x39: "InitHeap", 0x3F: "printf",
+           0x44: "FlushCache", 0x49: "GPU_cw", 0x70: "_bu_init", 0x72: "CdRemove", 0x9F: "SetMem", 0xA1: "SystemError"},
+    0xB0: {0x07: "DeliverEvent", 0x08: "OpenEvent", 0x09: "CloseEvent", 0x0A: "WaitEvent", 0x0B: "TestEvent",
+           0x0C: "EnableEvent", 0x0D: "DisableEvent", 0x0E: "OpenTh", 0x0F: "CloseTh", 0x10: "ChangeTh",
+           0x12: "InitPAD", 0x13: "StartPAD", 0x14: "StopPAD", 0x15: "PAD_init", 0x16: "PAD_dr",
+           0x17: "ReturnFromException", 0x18: "ResetEntryInt", 0x19: "HookEntryInt", 0x20: "UnDeliverEvent",
+           0x32: "open", 0x33: "lseek", 0x34: "read", 0x35: "write", 0x36: "close", 0x3F: "puts",
+           0x42: "firstfile", 0x43: "nextfile", 0x44: "rename", 0x45: "erase", 0x4A: "InitCARD", 0x4B: "StartCARD",
+           0x4C: "StopCARD", 0x4E: "_card_write", 0x4F: "_card_read", 0x50: "_new_card", 0x56: "GetC0Table",
+           0x57: "GetB0Table", 0x5B: "ChangeClearPad"},
+    0xC0: {0x0A: "ChangeClearRCnt"},
+}
+
+
+def bios_stub_name(data, delta, pc):
+    """`addiu t2, zero, 0xA0|0xB0|0xC0; jr t2; addiu t1, zero, N`: the BIOS function's name."""
+    off = pc - delta
+    if off < 0 or off + 12 > len(data):
+        return None
+    a, b, c = struct.unpack_from("<3I", data, off)
+    if (a >> 16) != 0x240A or b != 0x01400008 or (c >> 16) != 0x2409:
+        return None
+    return BIOS.get(a & 0xFFFF, {}).get(c & 0xFFFF)
+
+
+def section_name_of(disc_name):
+    """A C name for a file's section: SLUS_010.32 -> slus_010, SYSTEM/X00.BIN|... -> x00."""
+    base = os.path.splitext(os.path.basename(disc_name.split("|")[0]))[0].lower()
+    return re.sub(r"[^a-z0-9_]", "_", base)
+
+
+def load_file(spec, decomp, disc_dir):
+    """A --file: (disc name, data, code ranges, file offset -> vram delta, symbols)."""
+    if "=" in spec:
+        disc_name, yaml_path = spec.split("=", 1)
+        with open(os.path.join(decomp, yaml_path), encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+        ranges, delta = code_ranges(config)
+        if delta is None:
+            raise SystemExit(f"{yaml_path}: no segment with a vram")
+        syms = read_symbols(config_symbol_paths(config, decomp))
+    elif "@" in spec:
+        disc_name, vram = spec.split("@", 1)
+        delta = int(vram, 0)
+        ranges, syms = None, []
+    else:
+        raise SystemExit(f"--file {spec}: DISCFILE=yaml or DISCFILE@0xVRAM")
+    # PRIMARY|ALIAS|...: the same file at several places on the disc (the primary is read; a
+    # read of any of them loads the section)
+    with open(os.path.join(disc_dir, disc_name.split("|")[0]), "rb") as f:
+        data = f.read()
+    data += b"\0" * ((-len(data)) % 4)
+    if ranges is None:
+        ranges = [(delta, delta + len(data), False)]  # all of it: scanned
+    return disc_name, data, merge(ranges), delta, syms
+
+
+def runs_into(data, delta, start, end):
+    """Whether the code of the function at `start` runs on past `end` (the next symbol): its last
+    instructions before `end` (padding aside) are not a return or a jump away (jr, j, b) and its
+    delay slot."""
+    def word(pc):
+        return struct.unpack_from("<I", data, pc - delta)[0]
+
+    def leaves(w):
+        return (w & 0xFC1FFFFF) == 0x00000008 or w >> 26 == 2 or w >> 16 == 0x1000
+
+    pc = end - 4
+    while pc > start and word(pc) == 0:
+        pc -= 4
+    return pc > start and not leaves(word(pc)) and not leaves(word(pc - 4))
+
+
+def carve_entry(boot):
+    """The boot executable's entry point (PS-X EXE pc0) is recompiled, also where a config counts
+    it as library code (PsyQ's start code sits among the libraries): its function leaves the
+    PsyQ range it is in, as far as its code goes."""
+    import ps1_scan
+    name, data, ranges, delta, syms = boot
+    pc0 = struct.unpack_from("<I", data, 0x10)[0]
+    for k, (lo, hi, is_psyq) in enumerate(ranges):
+        if lo <= pc0 < hi and is_psyq:
+            res = ps1_scan.Code(data, delta, lo, hi).walk(pc0, set())
+            if res is None:
+                raise SystemExit(f"{name}: the entry point {pc0:08X} isn't code")
+            end = min(max(res[0]) + 4, hi)
+            ranges[k:k + 1] = [r for r in ((lo, pc0, True), (pc0, end, False), (end, hi, True)) if r[1] > r[0]]
+            print(f"{name}: entry point {pc0:08X}-{end:08X} recompiled (it was in PsyQ code)")
+            return
+
+
+def scan(loaded, specs):
+    """ps1_scan.py over every file's game code: the functions nobody named (rounds, as one file's
+    code reveals calls into another's). A call from one file into its own address span is its
+    own (overlays share addresses); one outside it is into the files loaded there."""
+    import ps1_scan
+    found = [dict() for _ in loaded]
+    calls = [set() for _ in loaded]  # jal targets of each file's code
+    spans = [(delta, delta + len(data)) for _, data, _, delta, _ in loaded]
+    # words of the other files: their data may point at this one's code (callback tables)
+    pointers = set()
+    for _, data, _, _, _ in loaded:
+        pointers.update(w for w in struct.unpack(f"<{len(data) // 4}I", data) if 0x80000000 <= w < 0x80200000 and not w & 3)
+    others = [pointers] * len(loaded)
+    for _ in range(4):
+        before = [len(c) for c in calls]
+        for i, (name, data, ranges, delta, syms) in enumerate(loaded):
+            named = {a for _, a in syms if not a & 3}
+            into = set(calls[i])
+            for j, c in enumerate(calls):
+                if j != i:
+                    into |= {t for t in c if not spans[j][0] <= t < spans[j][1]}
+            for k, (lo, hi, is_psyq) in enumerate(ranges):
+                # (library code too: what the symbols don't name in it is recompiled)
+                own = {t for t in calls[i] if lo <= t < hi}
+                # calls from other files: only where a function can start (overlays share addresses)
+                other = {t for t in into - calls[i] if lo <= t < hi and ps1_scan.plausible_start(data, delta, lo, hi, t)}
+                # a code range from a config starts a function (a scanned overlay starts with a table)
+                first = set() if "=" not in specs[i] else {lo}
+                seeds = {a for a in named if lo <= a < hi} | own | first
+                starts, code_end, outside, ends = ps1_scan.discover(data, delta, lo, hi, seeds, others[i], other,
+                                                                    {a for a in named if lo <= a < hi})
+                found[i][k] = (starts, code_end, ends)
+                calls[i] |= outside
+        if [len(c) for c in calls] == before:
+            break
+    return found, set().union(*calls)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--decomp", required=True)
     ap.add_argument("--disc-dir", required=True, help="folder with the disc's files (extract_disc.py output)")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--file", action="append", required=True, help="DISCFILE=splat yaml (relative to --decomp)")
+    ap.add_argument("--file", action="append", required=True,
+                    help="DISCFILE=splat yaml (relative to --decomp), or DISCFILE@0xVRAM (no config: scanned)")
+    ap.add_argument("--scan", action="store_true", help="find the functions the symbols don't name")
+    ap.add_argument("--rename", action="append", default=[],
+                    help="OLD=NEW: a function the decomp's symbols name wrongly (a PsyQ function is the "
+                         "runtime's by its name)")
+    ap.add_argument("--name", action="append", default=[],
+                    help="0xADDR=NAME: a library function the decomp's symbols don't name (the runtime has "
+                         "it by NAME)")
     args = ap.parse_args()
+    renames = dict(r.split("=", 1) for r in args.rename)
+    extra_names = [(n, int(a, 0)) for a, n in (s.split("=", 1) for s in args.name)]
 
     os.makedirs(args.out, exist_ok=True)
     rom = bytearray()
@@ -143,30 +288,24 @@ def main():
     files = []
     used_names = set()
     data_syms = {}
+    loaded = [load_file(spec, args.decomp, args.disc_dir) for spec in args.file]
+    loaded = [(n, d, r, dl, [(renames.get(s, s), a) for s, a in syms] +
+               [(s, a) for s, a in extra_names if any(lo <= a < hi for lo, hi, _ in r)])
+              for n, d, r, dl, syms in loaded]
+    carve_entry(loaded[0])
+    if any("@" in spec and "=" not in spec for spec in args.file) and not args.scan:
+        raise SystemExit("a --file NAME@0xVRAM is scanned: add --scan")
+    scanned, scan_targets = scan(loaded, args.file) if args.scan else ([{} for _ in loaded], set())
     # calls from game code into PsyQ code at addresses the symbols don't name
-    loaded = []
-    for spec in args.file:
-        disc_name, yaml_path = spec.split("=", 1)
-        with open(os.path.join(args.decomp, yaml_path), encoding="utf-8") as f:
-            config = yaml.safe_load(f)
-        with open(os.path.join(args.disc_dir, disc_name), "rb") as f:
-            data = f.read()
-        ranges, delta = code_ranges(config)
-        loaded.append((ranges, delta, jal_targets(data, delta, ranges)))
-    all_targets = set().union(*(t for _, _, t in loaded))
-    all_ranges = [r for ranges, _, _ in loaded for r in ranges]
+    all_targets = set().union(*(jal_targets(data, delta, ranges) for _, data, ranges, delta, _ in loaded)) \
+        if not args.scan else scan_targets
+    all_ranges = [r for _, _, ranges, _, _ in loaded for r in ranges]
 
-    for spec in args.file:
-        disc_name, yaml_path = spec.split("=", 1)
-        with open(os.path.join(args.decomp, yaml_path), encoding="utf-8") as f:
-            config = yaml.safe_load(f)
-        with open(os.path.join(args.disc_dir, disc_name), "rb") as f:
-            data = f.read()
-        data += b"\0" * ((-len(data)) % 4)
-        ranges, delta = code_ranges(config)
-        if delta is None:
-            raise SystemExit(f"{yaml_path}: no segment with a vram")
-        ranges = merge(ranges)
+    for file_index, (disc_name, data, ranges, delta, syms) in enumerate(loaded):
+        # an overlay scanned whole: its code ends where the scan does (data follows it)
+        for k, (lo, hi, is_psyq) in enumerate(list(ranges)):
+            if k in scanned[file_index] and "@" in args.file[file_index] and "=" not in args.file[file_index]:
+                ranges[k] = (lo, max(lo, scanned[file_index][k][1]), is_psyq)
         rom_base = len(rom)
         files.append(disc_name)
         # big-endian words (see above)
@@ -175,8 +314,8 @@ def main():
 
         vram_start = delta  # file offset 0
         vram_end = delta + len(data)
-        syms = read_symbols(config_symbol_paths(config, args.decomp))
         funcs = {}
+        data_after = {}  # a function's code ends early: data (or other code) follows it
         for name, addr in syms:
             if not any(lo <= addr < hi for lo, hi, _ in all_ranges):
                 data_syms.setdefault(name, addr)
@@ -186,19 +325,59 @@ def main():
                 if lo <= addr < hi:
                     funcs.setdefault(addr, (name, is_psyq, hi))
                     break
-        for target in all_targets:
+        # calls into library code the symbols don't name: a BIOS call stub is named after its
+        # BIOS function (the runtime has those); any other is recompiled, with the unnamed
+        # library code it calls in turn (the runtime can only stand in for what it can name)
+        todo = sorted(all_targets)
+        while todo:
+            target = todo.pop()
             for lo, hi, is_psyq in ranges:
-                if is_psyq and lo <= target < hi and target not in funcs:
+                if not (is_psyq and lo <= target < hi) or target in funcs:
+                    continue
+                bios = bios_stub_name(data, delta, target)
+                if bios is not None:
+                    funcs[target] = (bios if not any(n == bios for n, _, _ in funcs.values()) else f"psyq_{target:08X}", True, hi)
+                    break
+                import ps1_scan
+                res = ps1_scan.Code(data, delta, lo, hi).walk(target, set(funcs))
+                if res is None:
                     funcs[target] = (f"psyq_{target:08X}", True, hi)
-        # every code range starts a function (a symbol-less start is named after its address)
-        for lo, hi, is_psyq in ranges:
-            if lo not in funcs:
+                    break
+                funcs[target] = (f"func_{target:08X}", False, hi)
+                data_after[target] = max(res[0]) + 4
+                todo.extend(c for c in res[1] if lo <= c < hi and c not in funcs)
+                break
+        # the functions the scan found (named after their address); in library code, those the
+        # symbols don't name are recompiled (the runtime stands in for named ones only)
+        for k, (starts, _, ends) in scanned[file_index].items():
+            data_after.update(ends)
+            lo, hi, is_psyq = ranges[k]
+            for a in starts:
+                if lo <= a < hi and a not in funcs:
+                    bios = bios_stub_name(data, delta, a) if is_psyq else None
+                    if bios is not None and not any(n == bios for n, _, _ in funcs.values()):
+                        funcs[a] = (bios, True, hi)
+                    else:
+                        funcs[a] = (f"func_{a:08X}", False, hi)
+        # every code range starts a function (a symbol-less start is named after its address),
+        # unless it is a scanned overlay's (its code starts after a table)
+        for k, (lo, hi, is_psyq) in enumerate(ranges):
+            if lo not in funcs and not (k in scanned[file_index] and "=" not in args.file[file_index]):
                 funcs[lo] = (f"func_{lo:08X}", is_psyq, hi)
         addrs = sorted(funcs)
         entries = []
         for i, addr in enumerate(addrs):
             name, is_psyq, range_end = funcs[addr]
-            end = min(addrs[i + 1] if i + 1 < len(addrs) else range_end, range_end)
+            end = min(addrs[i + 1] if i + 1 < len(addrs) else range_end, range_end, data_after.get(addr, range_end))
+            # a label the symbols put inside a function (its code runs on into it): the function goes
+            # on to its own end (the label stays a function too, for calls to it)
+            if not is_psyq and i + 1 < len(addrs) and end == addrs[i + 1] and not funcs[end][1] and end < range_end and \
+                    runs_into(data, delta, addr, end):
+                import ps1_scan
+                lo = max(r_lo for r_lo, r_hi, _ in ranges if r_lo <= addr < r_hi)
+                res = ps1_scan._code(data, delta, lo, range_end).walk(addr, set())
+                if res is not None and max(res[0]) + 4 > end:
+                    end = min(max(res[0]) + 4, range_end)
             if is_psyq:
                 psyq.add(name)
                 entries.append((f"{name}_recomp", addr, 0))
@@ -206,12 +385,12 @@ def main():
             # overlays reuse names (and addresses): each C function needs its own
             if name in RESERVED:
                 name = f"{name}_game"
-            unique = name if name not in used_names else f"{name}_{os.path.splitext(disc_name)[0].lower()}"
+            unique = name if name not in used_names else f"{name}_{section_name_of(disc_name)}"
             while unique in used_names:
                 unique += "_"
             used_names.add(unique)
             entries.append((unique, addr, end - addr))
-        section_name = os.path.splitext(disc_name)[0].lower().replace(".", "_")
+        section_name = section_name_of(disc_name)
         sections.append((section_name, rom_base, vram_start, vram_end - vram_start, entries))
         game_funcs = sum(1 for e in entries if e[2] > 0)
         print(f"{disc_name}: vram 0x{vram_start:08X}-0x{vram_end:08X}, {game_funcs} functions, "

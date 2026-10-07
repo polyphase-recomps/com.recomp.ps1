@@ -108,6 +108,13 @@ void port_host_fatal(const char *msg)
     host_crashed();
 }
 
+/* (recomp mode's threads: leave the game from the start thread's stack - here, the end) */
+void host_unwind(int code)
+{
+    if (code == 1) host_crashed();
+    ExitProcess(0);
+}
+
 void host_crashed(void)
 {
     if (sShm)

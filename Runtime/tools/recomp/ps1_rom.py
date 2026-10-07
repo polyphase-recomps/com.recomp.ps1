@@ -78,7 +78,7 @@ def main():
     read = disc_files(args.disc)
     rom = bytearray()
     for i, name in enumerate(files):
-        data = read(name)
+        data = read(name.split("|")[0])  # (PRIMARY|ALIAS...: the same file at several places)
         if i == 0 and args.sha1:
             sha1 = hashlib.sha1(data).hexdigest()
             if sha1 != args.sha1.lower():

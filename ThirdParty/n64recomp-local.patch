@@ -1,5 +1,5 @@
 diff --git a/ThirdParty/N64Recomp/LiveRecomp/live_generator.cpp b/ThirdParty/N64Recomp/LiveRecomp/live_generator.cpp
-index 61e1ff5..f342ca1 100644
+index 8811655..33b1f40 100644
 --- a/ThirdParty/N64Recomp/LiveRecomp/live_generator.cpp
 +++ b/ThirdParty/N64Recomp/LiveRecomp/live_generator.cpp
 @@ -1,4 +1,5 @@
@@ -294,7 +294,7 @@ index 61e1ff5..f342ca1 100644
 +    return true;
 +}
 diff --git a/ThirdParty/N64Recomp/include/recompiler/context.h b/ThirdParty/N64Recomp/include/recompiler/context.h
-index e7b4431..4fee63a 100644
+index e26eccc..5efe7fd 100644
 --- a/ThirdParty/N64Recomp/include/recompiler/context.h
 +++ b/ThirdParty/N64Recomp/include/recompiler/context.h
 @@ -270,6 +270,9 @@ namespace N64Recomp {
@@ -308,7 +308,7 @@ index e7b4431..4fee63a 100644
          // Imports sections and function symbols from a provided context into this context's reference sections and reference functions.
          bool import_reference_context(const Context& reference_context);
 diff --git a/ThirdParty/N64Recomp/include/recompiler/generator.h b/ThirdParty/N64Recomp/include/recompiler/generator.h
-index 145bcd0..2c10a43 100644
+index 146dcec..3d072d3 100644
 --- a/ThirdParty/N64Recomp/include/recompiler/generator.h
 +++ b/ThirdParty/N64Recomp/include/recompiler/generator.h
 @@ -61,10 +61,26 @@ namespace N64Recomp {
@@ -352,7 +352,7 @@ index 145bcd0..2c10a43 100644
          void get_operand_string(Operand operand, UnaryOpType operation, const InstructionContext& context, std::string& operand_string) const;
          void get_binary_expr_string(BinaryOpType type, const BinaryOperands& operands, const InstructionContext& ctx, const std::string& output, std::string& expr_string) const;
 diff --git a/ThirdParty/N64Recomp/include/recompiler/live_recompiler.h b/ThirdParty/N64Recomp/include/recompiler/live_recompiler.h
-index d155b83..bb097a6 100644
+index 9e47f02..9aa3f1e 100644
 --- a/ThirdParty/N64Recomp/include/recompiler/live_recompiler.h
 +++ b/ThirdParty/N64Recomp/include/recompiler/live_recompiler.h
 @@ -86,6 +86,36 @@ namespace N64Recomp {
@@ -428,7 +428,7 @@ index d155b83..bb097a6 100644
          mutable bool errored;
      };
 diff --git a/ThirdParty/N64Recomp/src/analysis.cpp b/ThirdParty/N64Recomp/src/analysis.cpp
-index 9eaaa30..456c3a0 100644
+index 22d5d23..7a1e924 100644
 --- a/ThirdParty/N64Recomp/src/analysis.cpp
 +++ b/ThirdParty/N64Recomp/src/analysis.cpp
 @@ -340,6 +340,12 @@ bool N64Recomp::analyze_function(const N64Recomp::Context& context, const N64Rec
@@ -455,7 +455,7 @@ index 9eaaa30..456c3a0 100644
      return true;
  }
 diff --git a/ThirdParty/N64Recomp/src/cgenerator.cpp b/ThirdParty/N64Recomp/src/cgenerator.cpp
-index 94f85c5..c9d4163 100644
+index 4bea22f..90f1fc0 100644
 --- a/ThirdParty/N64Recomp/src/cgenerator.cpp
 +++ b/ThirdParty/N64Recomp/src/cgenerator.cpp
 @@ -421,6 +421,12 @@ void N64Recomp::CGenerator::emit_function_call_reference_symbol(const Context& c
@@ -527,7 +527,7 @@ index 94f85c5..c9d4163 100644
 +    return true;
 +}
 diff --git a/ThirdParty/N64Recomp/src/config.cpp b/ThirdParty/N64Recomp/src/config.cpp
-index 1066aff..50af1d6 100644
+index d04cd3c..5028aff 100644
 --- a/ThirdParty/N64Recomp/src/config.cpp
 +++ b/ThirdParty/N64Recomp/src/config.cpp
 @@ -297,6 +297,10 @@ N64Recomp::Config::Config(const char* path) {
@@ -542,7 +542,7 @@ index 1066aff..50af1d6 100644
  
          if (entrypoint_data) {
 diff --git a/ThirdParty/N64Recomp/src/config.h b/ThirdParty/N64Recomp/src/config.h
-index 7d6db23..ce51f7a 100644
+index 125f010..8bb4d15 100644
 --- a/ThirdParty/N64Recomp/src/config.h
 +++ b/ThirdParty/N64Recomp/src/config.h
 @@ -45,6 +45,8 @@ namespace N64Recomp {
@@ -555,7 +555,7 @@ index 7d6db23..ce51f7a 100644
          bool strict_patch_mode;
          std::filesystem::path elf_path;
 diff --git a/ThirdParty/N64Recomp/src/main.cpp b/ThirdParty/N64Recomp/src/main.cpp
-index 669c4a1..198ca26 100644
+index 393528d..ab93103 100644
 --- a/ThirdParty/N64Recomp/src/main.cpp
 +++ b/ThirdParty/N64Recomp/src/main.cpp
 @@ -471,7 +471,8 @@ int main(int argc, char** argv) {
@@ -577,7 +577,7 @@ index 669c4a1..198ca26 100644
      // Apply any single-instruction patches.
      for (const N64Recomp::InstructionPatch& patch : config.instruction_patches) {
 diff --git a/ThirdParty/N64Recomp/src/recompilation.cpp b/ThirdParty/N64Recomp/src/recompilation.cpp
-index c228433..10b37e5 100644
+index 4e236c9..614cac8 100644
 --- a/ThirdParty/N64Recomp/src/recompilation.cpp
 +++ b/ThirdParty/N64Recomp/src/recompilation.cpp
 @@ -46,7 +46,10 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
@@ -592,7 +592,33 @@ index c228433..10b37e5 100644
                      continue;
                  }
              }
-@@ -127,7 +130,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+@@ -76,6 +79,13 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
+         }
+         // Otherwise, create a static function at the target address.
+         else {
++            // com.recomp.ps1: the symbols (ps1_syms.py) already start a function at every call
++            // target that is code; a call to anything else is one overlay calling another's
++            // function at an address they share (here the middle of a function, or data): it is
++            // looked up when it runs
++            if (context.ps1) {
++                return JalResolutionResult::Ambiguous;
++            }
+             return JalResolutionResult::CreateStatic;
+         }
+     }
+@@ -84,6 +94,11 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
+         // If there were no matches then JAL resolution has failed.
+         // A static can't be created as the target section is unknown.
+         if (matched_funcs.size() == 0) {
++            // com.recomp.ps1: a call into another file's address space that no known function
++            // starts at (an overlay region several files share) is looked up when it runs
++            if (context.ps1) {
++                return JalResolutionResult::Ambiguous;
++            }
+             return JalResolutionResult::NoMatch;
+         }
+         // If there was an exact match, use it.
+@@ -127,7 +142,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
      };
  
      auto hook_find = func.function_hooks.find(instr_index);
@@ -601,7 +627,7 @@ index c228433..10b37e5 100644
          fmt::print(output_file, "    {}\n", hook_find->second);
          if (indent) {
              print_indent();
-@@ -410,6 +413,67 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+@@ -410,6 +425,67 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
  
      bool handled = true;
  
@@ -669,7 +695,7 @@ index c228433..10b37e5 100644
      switch (instr_id) {
      case InstrId::cpu_nop:
          fmt::print(output_file, "\n");
-@@ -563,9 +627,12 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+@@ -563,9 +639,12 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
      case InstrId::cpu_syscall:
          print_indent();
          generator.emit_syscall(instr_vram);
@@ -685,7 +711,7 @@ index c228433..10b37e5 100644
          break;
      case InstrId::cpu_break:
          print_indent();
-@@ -780,7 +847,7 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
+@@ -780,7 +859,7 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
          instructions.reserve(func.words.size());
  
          auto hook_find = func.function_hooks.find(-1);

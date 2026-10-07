@@ -43,6 +43,8 @@ of the snapshot with `git diff --no-index`, paths rewritten to `ThirdParty/N64Re
   - Size-0 symbols named `<name>_recomp` are runtime functions (the PsyQ libraries), and a `jal`
     to one is a call by name.
   - A jump table with no entries in the image (filled at run time) becomes an indirect call.
+  - A `jal` no known function starts at (into an overlay region several files share, or the
+    middle of another file's function) is looked up when it runs, not an error.
   - setjmp is inlined as a host `setjmp` at the call site.
   - LiveRecomp: the same hooks through `LiveGeneratorInputs`; loads and stores go through the
     runtime's address folding (`ps1_fold`) with no byte swizzle; `lwl/lwr/swl/swr` are

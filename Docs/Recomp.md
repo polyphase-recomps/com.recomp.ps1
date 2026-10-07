@@ -12,7 +12,7 @@ Windows x64 only (editor and PC builds). Consoles keep the decomp builds.
 |---|---|---|
 | Decomp | the decomp translated by wasm2c (`Source/Guest/<name>`) | the disc (extracted into the package) |
 | Recomp | the game recompiled from the developer's disc, as C, in a library | the disc |
-| Recomp (live) | the runtime and N64Recomp's LiveRecomp, **no game code** | the disc: the game is recompiled from it when it boots (about 0.2 s) |
+| Recomp (live) | the runtime and N64Recomp's LiveRecomp, **no game code** | the disc: the game is recompiled from it when it boots (0.2 s for Digimon World, 0.9 s for Tomba!) |
 
 Recomp (live) is the one for releases: a build holds no code from the game at all.
 
@@ -38,6 +38,17 @@ PsyQ replacement ──function pointers (callbacks)──► ps1w_guest_callbac
 - **The runtime** (`Runtime/recomp/`): boot from SYSTEM.CNF and the PS-X EXE header, code lookup,
   callbacks into the game, the GTE (through the libraries' `port_gte_*`), cop0, setjmp/longjmp,
   a small libc on guest memory, and a crash report naming the guest return address.
+- **Interrupts**: events with a handler (`OpenEvent` with `EvMdINTR`, e.g. a vblank counter on
+  root counter 3) run when the vblank they wait for comes: from `VSync`, and from the loop checks.
+- **Loop checks**: every loop's back edge counts down a budget (`RECOMP_LOOP_CHECK`, added to the C
+  by `ps1_loop_checks.py`; LiveRecomp's `loop_budget`). At zero the runtime catches up with the
+  vblanks gone by without a `VSync` (the frame shown, the interrupts, the drive, the sound: what a
+  PS1 does whatever the CPU runs), and a loop that comes back to the same check in the same frame
+  with the same registers is waiting: it gets a `VSync(0)`. A loop that works (a copy, a clear)
+  has its counters moved on and runs undisturbed. The libraries' own waits (`StGetNext`, `PadRead`
+  pacing) catch up the same way. `--debug-loops N` logs where the game loops every N frames.
+- **BIOS threads** (`OpenTh` / `ChangeTh` / `CloseTh`, a game's task system) are host fibers,
+  each with its own register file; a stop or a crash on one goes back to thread 0 first.
 - The game is a `Ps1wModule` (`ps1w_module_<name>_recomp`), so every host of a wasm2c guest
   runs it unchanged: Ps1Player in the editor and in packaged games, and the standalone program
   (`<name>_recomp.exe`: window, `--headless`, `--dump`, `--wav`, `--script` as the decomp
@@ -74,6 +85,26 @@ The first `--file` is the boot executable; one more per overlay file. Functions 
 in each file's code (splat `c` / `asm` subsegments); PsyQ library segments become runtime calls.
 Names that clash with C (`main`, `memcpy` ...) get `_game`. Copy `syms.toml`, `psyq.txt` and
 `data_symbols.txt` into `Recomp/`. They hold symbols only, no game code.
+
+A decomp that is far from done (`com.recomp.tomba`) needs more:
+
+- `--scan` finds the functions the symbols don't name: walks from the named ones and their calls,
+  jump tables (`lui/addu/lw` + `jr`), function pointers in any file's data, addresses the code
+  builds (`lui/addiu`), stack frames set up where no walk went, code right after a function's end
+  or after data (a table, then its function). Each candidate's walk must be valid MIPS (no writes
+  to `$zero`, fields an instruction leaves zero, no `lb` from `$zero`: that is a RAM pointer, as
+  data tables are full of), and the result is checked as N64Recomp does (branches stay inside).
+  On Digimon World with its game functions' names taken away it finds 2734 of 2741, and no false
+  ones.
+- `--file NAME@0xVRAM`: an overlay with no splat config, scanned whole. `--file A|B|C@0xVRAM`: the
+  same file at several places on the disc (identical copies): a read of any of them loads it.
+- Unnamed library code the game calls is recompiled (the runtime can only stand in for named
+  functions), except BIOS call stubs, which are named after their BIOS function.
+- `--rename OLD=NEW`: a function the decomp names wrongly, when the runtime has it by its real name
+  (Tomba's `SpuRead` calls `_spu_write`: it is `SpuWrite`). `--name 0xADDR=NAME`: a library
+  function the symbols lack (Tomba's libpad).
+- A symbol inside a function (the code before it runs on into it, no return or jump between) is
+  kept for calls to it, and the function before it goes on to its own end.
 
 ## Building
 
@@ -179,6 +210,9 @@ testing):
 <game>/Native/build/recomp-RelWithDebInfo/dw_recomp.exe --disc "<image or Assets/Disc/disc.idx>" --headless --frames 20000 --dump out --every 1000 --script "<script>"
 ```
 
+Pad bits in `--script` are PsyQ `PadRead`'s (Cross 0x40, Circle 0x20, Square 0x80, Triangle 0x10,
+Start 0x800, Up/Right/Down/Left 0x1000/0x2000/0x4000/0x8000).
+
 For a live build, `PS1_RECOMP_DIR=<folder with game.json and syms.toml>` gives the data. Digimon
 World (2026-10-06): 4204 functions; Recomp, Recomp (live) and the extracted-disc run all give
 frames identical to each other over 20000 frames of title, new game, memory card save, name
@@ -190,3 +224,9 @@ reach it with the same random number state, and the first enemy hit (frame ~1783
 the decomp port and not in the recompiled game. Which is the original's behaviour needs a third
 reference (an emulator); the decomp port is C compiled for another machine, the recomp the
 original code.
+
+Tomba! (2026-10-07, `com.recomp.tomba`): 8274 functions in the exe and 25 overlays, 24 of them
+found by the scanner. The boot screens, the intro and story movies (the game's own STR player,
+libcd streaming and libpress, with XA audio), the title screen, a new game, the first village's
+dialogs and gameplay, sound and music, over 8000 scripted frames. Recomp and Recomp (live) give
+identical frames. Digimon World's frames stayed identical through the changes Tomba needed.

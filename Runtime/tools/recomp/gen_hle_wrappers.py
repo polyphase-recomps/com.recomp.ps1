@@ -20,10 +20,14 @@ import re
 import sys
 
 EXPORT_RE = re.compile(r"^(u32|u64|void|f32|f64|s32|s64)\s+w2c_ps1hle_(\w+)\(w2c_ps1hle\*(?:\s*\w*)?(?:,\s*([^)]*))?\);")
+# the export's own name (wasm2c escapes some characters in the C name: _bu_init -> 0x5Fbu_init)
+EXPORT_NAME_RE = re.compile(r"^/\* export: '([^']+)' \*/")
+# PsyQ names the runtime's libraries give another name (they'd clash with the host's C library)
+ALIASES = {"open": "ps1_open", "read": "ps1_read", "write": "ps1_write", "lseek": "ps1_lseek", "close": "ps1_close"}
 # fixed arguments before the variadic ones
 VARIADIC = {"printf": 1, "sprintf": 2}
 # in the runtime itself (recomp_ps1.c, recomp_libc.c)
-RUNTIME = {"setjmp", "longjmp", "memcpy", "memmove", "memset", "memcmp", "strlen", "strcpy", "strncpy", "strcat",
+RUNTIME = {"OpenTh", "ChangeTh", "CloseTh", "GetGp", "setjmp", "longjmp", "memcpy", "memmove", "memset", "memcmp", "strlen", "strcpy", "strncpy", "strcat",
            "strcmp", "strncmp", "strchr", "strrchr", "abs"}
 
 
@@ -37,11 +41,17 @@ def main():
     header, psyq_path, out = sys.argv[1:4]
     exports = {}
     with open(header, encoding="utf-8") as f:
+        export_name = None
         for line in f:
+            n = EXPORT_NAME_RE.match(line.strip())
+            if n:
+                export_name = n.group(1)
+                continue
             m = EXPORT_RE.match(line.strip())
             if m:
                 params = [p.strip() for p in (m.group(3) or "").split(",") if p.strip()]
-                exports[m.group(2)] = (m.group(1), params)
+                exports[export_name or m.group(2)] = (m.group(1), params, m.group(2))
+            export_name = None
     with open(psyq_path, encoding="utf-8") as f:
         names = [n.strip() for n in f if n.strip()]
 
@@ -65,14 +75,14 @@ def main():
             lines.append(f"void {name}_recomp(uint8_t *rdram, recomp_context *ctx);")
             continue
         decls.append(f"void {name}_recomp(uint8_t *rdram, recomp_context *ctx);")
-        exp = exports.get(name)
+        exp = exports.get(ALIASES.get(name, name))
         ok = exp is not None and exp[0] in ("u32", "u64", "void", "s32", "s64") and \
             all(p in ("u32", "s32") for p in exp[1])
         if not ok:
             lines.append(f"void {name}_recomp(uint8_t *rdram, recomp_context *ctx) {{ ps1r_missing(\"{name}\", ctx); }}")
             missing += 1
             continue
-        ret, params = exp
+        ret, params, cname = exp
         if name in VARIADIC:
             fixed = VARIADIC[name]
             if len(params) != fixed + 1:
@@ -87,7 +97,7 @@ def main():
         else:
             body = []
             call_args = [arg(i) for i in range(len(params))]
-        call = f"w2c_ps1hle_{name}(&ps1r_hle{''.join(', ' + a for a in call_args)})"
+        call = f"w2c_ps1hle_{cname}(&ps1r_hle{''.join(', ' + a for a in call_args)})"
         lines.append(f"void {name}_recomp(uint8_t *rdram, recomp_context *ctx)")
         lines.append("{")
         lines.append("    ps1r_enter(ctx);")

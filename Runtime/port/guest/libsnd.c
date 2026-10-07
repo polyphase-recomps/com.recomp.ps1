@@ -41,8 +41,11 @@ typedef struct
     short progTone[128];         /* first VagAtr index for a program, -1 if none */
     unsigned long vagOffset[256];
     unsigned long vagSize[256];
-    unsigned char *body;         /* copied VB */
+    unsigned char *body;         /* the VB: copied (SsVabTransBody), or in SPU memory (SsVabFakeBody) */
     unsigned long bodySize;
+    unsigned char *own;          /* SsVabTransBody's copy */
+    unsigned long ownSize;
+    unsigned long spuAddr;       /* SsVabFakeHead: where the body is in SPU memory */
 } Vab;
 
 static Vab sVabs[NUM_VABS];
@@ -379,18 +382,89 @@ short SsVabTransBody(unsigned char *addr, short vabid)
 
     if (vabid < 0 || vabid >= NUM_VABS || !sVabs[vabid].open) return -1;
     vab = &sVabs[vabid];
-    if (vab->body == 0 || vab->bodySize > 0)
+    /* banks are reloaded often; keep one buffer per slot, grown as needed */
+    if (vab->own == 0 || vab->ownSize < vab->bodySize)
     {
-        /* banks are reloaded often; keep one buffer per slot, grown as needed */
-        static unsigned long capacity[NUM_VABS];
-
-        if (capacity[vabid] < vab->bodySize)
-        {
-            vab->body = (unsigned char *)port_alloc(vab->bodySize);
-            capacity[vabid] = vab->bodySize;
-        }
+        vab->own = (unsigned char *)port_alloc(vab->bodySize);
+        vab->ownSize = vab->bodySize;
     }
+    vab->body = vab->own;
     for (i = 0; i < vab->bodySize; i++) vab->body[i] = addr[i];
+    return vabid;
+}
+
+/* ---- SPU memory: what the game transfers itself (SpuWrite, SpuRead); a bank whose body it put
+ * there plays from it (SsVabFakeHead / SsVabFakeBody) */
+#define SPU_RAM_SIZE 0x80000
+static unsigned char *sSpuRam;
+static unsigned long sSpuTransferAddr = 0x1010;
+
+static unsigned char *spu_ram(void)
+{
+    if (sSpuRam == 0) sSpuRam = (unsigned char *)port_alloc(SPU_RAM_SIZE);
+    return sSpuRam;
+}
+
+unsigned long SpuSetTransferStartAddr(unsigned long addr)
+{
+    if (addr < 0x1010 || addr >= SPU_RAM_SIZE) return 0;
+    sSpuTransferAddr = addr & ~7ul;
+    return sSpuTransferAddr;
+}
+
+unsigned long SpuGetTransferStartAddr(void)
+{
+    return sSpuTransferAddr;
+}
+
+long SpuSetTransferMode(long mode)
+{
+    return mode;
+}
+
+unsigned long SpuWrite(unsigned char *addr, unsigned long size)
+{
+    unsigned char *ram = spu_ram();
+    unsigned long i;
+
+    if (size > SPU_RAM_SIZE - sSpuTransferAddr) size = SPU_RAM_SIZE - sSpuTransferAddr;
+    for (i = 0; i < size; i++) ram[sSpuTransferAddr + i] = addr[i];
+    return size;
+}
+
+unsigned long SpuRead(unsigned char *addr, unsigned long size)
+{
+    unsigned char *ram = spu_ram();
+    unsigned long i;
+
+    if (size > SPU_RAM_SIZE - sSpuTransferAddr) size = SPU_RAM_SIZE - sSpuTransferAddr;
+    for (i = 0; i < size; i++) addr[i] = ram[sSpuTransferAddr + i];
+    return size;
+}
+
+/* transfers complete at once */
+long SpuIsTransferCompleted(long flag)
+{
+    return 1;
+}
+
+short SsVabOpenHead(unsigned char *addr, short vabid);
+
+short SsVabFakeHead(unsigned char *addr, short vabid, unsigned long sbaddr)
+{
+    vabid = SsVabOpenHead(addr, vabid);
+    if (vabid >= 0) sVabs[vabid].spuAddr = sbaddr;
+    return vabid;
+}
+
+short SsVabFakeBody(short vabid)
+{
+    Vab *vab;
+
+    if (vabid < 0 || vabid >= NUM_VABS || !sVabs[vabid].open) return -1;
+    vab = &sVabs[vabid];
+    if (vab->spuAddr >= SPU_RAM_SIZE || vab->bodySize > SPU_RAM_SIZE - vab->spuAddr) return -1;
+    vab->body = spu_ram() + vab->spuAddr;
     return vabid;
 }
 
@@ -417,6 +491,7 @@ void SsVabClose(short vabid)
 
 unsigned long SsUtGetVBaddrInSB(short vabid)
 {
+    if (vabid >= 0 && vabid < NUM_VABS && sVabs[vabid].spuAddr) return sVabs[vabid].spuAddr;
     return 0x1010 + (unsigned long)vabid * 0x8000;
 }
 
@@ -468,10 +543,53 @@ void SsUtAllKeyOff(short mode)
     }
 }
 
+/* a voice's pitch moved from one note to another (the tone it plays stays) */
+short SsUtChangePitch(short voice, short vabId, short prog, short old_note, short old_fine, short new_note,
+                      short new_fine)
+{
+    Voice *v;
+    double semis, p;
+
+    if (voice < 0 || voice >= NUM_SPU_VOICES) return -1;
+    v = &sVoices[voice];
+    semis = (new_note - old_note) + (new_fine - old_fine) / 128.0;
+    p = (double)v->pitch;
+    while (semis >= 1.0) { p *= 1.0594630943592953; semis -= 1.0; }
+    while (semis <= -1.0) { p /= 1.0594630943592953; semis += 1.0; }
+    p *= 1.0 + semis * 0.0594630943592953;
+    if (p > 0x3FFF) p = 0x3FFF;
+    if (p < 0) p = 0;
+    v->pitch = (unsigned long)p;
+    return 0;
+}
+
 void SsUtReverbOn(void) {}
 void SsUtReverbOff(void) {}
 void SsUtSetReverbType(short type) {}
 void SsUtSetReverbDepth(short ldepth, short rdepth) {}
+void SsUtSetReverbFeedback(short feedback) {}
+void SsUtSetReverbDelay(short delay) {}
+short SsUtGetReverbType(void) { return 0; }
+
+/* the library's setup choices: one mixer, voices on demand */
+void SsInitHot(void) {}
+void SsSetAutoKeyOffMode(short mode) {}
+char SsSetReservedVoice(char voices) { return voices; }
+void SsSetMono(void) {}
+void SsSetStereo(void) {}
+long SpuReserveReverbWorkArea(long on_off) { return on_off; }
+
+/* SPU_ON: the voices' attributes are libspu's (not kept here): only key-off is done */
+void SpuSetKey(long on_off, unsigned long voice_bit)
+{
+    int i;
+
+    if (on_off) return;
+    for (i = 0; i < NUM_SPU_VOICES; i++)
+    {
+        if (voice_bit & (1ul << i)) voice_release(&sVoices[i]);
+    }
+}
 
 long SpuGetKeyStatus(unsigned long voice_bit)
 {
@@ -488,6 +606,13 @@ long SpuGetKeyStatus(unsigned long voice_bit)
         }
     }
     return 0;
+}
+
+void SpuGetAllKeysStatus(char *status)
+{
+    int i;
+
+    for (i = 0; i < NUM_SPU_VOICES; i++) status[i] = (char)SpuGetKeyStatus(1ul << i);
 }
 
 /* ---- reverb: a small Schroeder network standing in for the SPU's room presets ---- */
@@ -906,6 +1031,13 @@ void SsSeqStop(short seq_access_num)
     }
 }
 
+/* 1 while the song plays */
+short SsIsEos(short access_num, short seq_num)
+{
+    if (access_num < 0 || access_num >= NUM_SEQS) return 0;
+    return sSeqs[access_num].open && sSeqs[access_num].playing;
+}
+
 void SsSeqSetVol(short seq_access_num, short voll, short volr)
 {
     if (seq_access_num < 0 || seq_access_num >= NUM_SEQS) return;
@@ -931,6 +1063,17 @@ static short sXaRing[XA_RING * 2];
 static unsigned sXaRead, sXaWrite;
 static int sCdVolL = 0x7FFF, sCdVolR = 0x7FFF, sCdMix = 1;
 static int sMute;
+/* CdMix: the CD's left and right into the SPU's (0x80 = 1.0) */
+static int sCdLL = 0x80, sCdLR = 0, sCdRR = 0x80, sCdRL = 0;
+
+int CdMix(unsigned char *vol)
+{
+    sCdLL = vol[0];
+    sCdLR = vol[1];
+    sCdRR = vol[2];
+    sCdRL = vol[3];
+    return 1;
+}
 
 /* Queues stereo 44100 Hz samples of the CD input (XA audio); the mixer plays them. */
 void port_cd_audio_queue(const short *samples, int frames)
@@ -966,6 +1109,13 @@ static void xa_mix(int *l, int *r)
     xl = sXaRing[(sXaRead % XA_RING) * 2];
     xr = sXaRing[(sXaRead % XA_RING) * 2 + 1];
     sXaRead++;
+    if (sCdLL != 0x80 || sCdLR || sCdRR != 0x80 || sCdRL)
+    {
+        const int l = (xl * sCdLL + xr * sCdRL) >> 7, r = (xr * sCdRR + xl * sCdLR) >> 7;
+
+        xl = l < -32768 ? -32768 : l > 32767 ? 32767 : l;
+        xr = r < -32768 ? -32768 : r > 32767 ? 32767 : r;
+    }
     if (!sCdMix || sMute) return;
     /* the master volume scales the result by 127/2 below; CD input is not halved */
     *l += (int)((long)xl * sCdVolL / 0x7FFF) * 2;

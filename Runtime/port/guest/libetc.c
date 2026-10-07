@@ -3,11 +3,14 @@
 #include <port_host.h>
 
 /* ---- libetc ------------------------------------------------------------------------------- */
-static unsigned sLastVsync;
+static unsigned sLastVsync; /* VSync(n) counts from the last call */
+static unsigned sLastWork;  /* the last vblank whose work was done (vblank_work) */
 void port_snd_render(int frames);
 static int sPadReadsSinceVsync;
 static void (*sVSyncCallback)(void);
 static void cd_vsync(void);
+static void vblank_work(void);
+static void pad_buffers(void);
 
 /* Runs `func` at every VSync (the PS1 runs it from the vertical blank interrupt). */
 int VSyncCallback(void (*func)(void))
@@ -22,6 +25,27 @@ void PadInit(int mode) {}
 void PadStop(void) {}
 
 #define AUDIO_CATCH_UP 22050 /* stereo frames at 44100 Hz */
+
+/* The vertical blank interrupt's events (root counter 3, RCntCNT3 / EvSpINT), for every vblank
+ * since the last call: from VSync, and (recomp mode) from a loop the game spins in waiting for
+ * what such a handler sets. After a long stall only the last two are delivered. */
+void DeliverEvent(unsigned long desc, long spec);
+void port_vblank_interrupts(void)
+{
+    static unsigned sDelivered;
+    static int sBusy;
+    const unsigned now = port_vblank_count();
+
+    if (sBusy) return; /* (a handler that waits) */
+    sBusy = 1;
+    if ((int)(now - sDelivered) > 2) sDelivered = now - 2;
+    while ((int)(now - sDelivered) > 0)
+    {
+        sDelivered++;
+        DeliverEvent(0xF2000003u, 0x0002);
+    }
+    sBusy = 0;
+}
 
 long VSync(int mode)
 {
@@ -48,6 +72,17 @@ long VSync(int mode)
     }
     sLastVsync = port_vblank_count();
     sPadReadsSinceVsync = 0;
+    vblank_work();
+    return 0;
+}
+
+/* What the vblank brings (VSync's, after its wait): the interrupts, the drive, the callback, the
+ * audio of the frames gone by. */
+static void vblank_work(void)
+{
+    sLastWork = port_vblank_count();
+    pad_buffers();
+    port_vblank_interrupts();
     cd_vsync();
     if (sVSyncCallback) sVSyncCallback();
     {
@@ -55,7 +90,7 @@ long VSync(int mode)
          * the clock (a slow host) gets the samples it owes made up, up to half a second;
          * beyond that (a stall, a load) the clock is followed from here. */
         static unsigned long long produced;
-        unsigned long long target = (unsigned long long)sLastVsync * 735;
+        unsigned long long target = (unsigned long long)sLastWork * 735;
 
         if (produced + AUDIO_CATCH_UP < target || produced > target) produced = target - 735;
         static int sNoSound = -1;
@@ -76,7 +111,21 @@ long VSync(int mode)
             produced += (unsigned long long)frames;
         }
     }
-    return 0;
+}
+
+/* Time passed without VSync: a game that waits its own way (a vblank counter of its interrupt
+ * handler, recomp mode's loop checks) or the libraries waiting for the drive or the pad. The
+ * PS1 shows the frame and plays the sound all the same: what VSync does at a vblank is done for
+ * the last one that went by (once each). */
+void port_vblank_catch_up(void)
+{
+    if (port_vblank_count() == sLastWork)
+    {
+        port_vblank_interrupts();
+        return;
+    }
+    gpu_present();
+    vblank_work();
 }
 
 unsigned long PadRead(int id)
@@ -86,9 +135,96 @@ unsigned long PadRead(int id)
     {
         port_wait_vblank();
         sPadReadsSinceVsync = 0;
+        port_vblank_catch_up();
     }
     return port_pad_state();
 }
+
+/* ---- the pads' buffers (BIOS InitPAD, libpad's PadInitDirect): the BIOS fills them at every
+ * vblank. Pad 1 is a digital pad (no analog mode, no actuators); pad 2 is not there. */
+static unsigned char *sPadBuf[2];
+static long sPadLen[2];
+static int sPadsOn;
+
+static void pad_buffers(void)
+{
+    const unsigned v = port_pad_state() & 0xFFFF;
+    int i;
+
+    if (!sPadsOn) return;
+    for (i = 0; i < 2; i++)
+    {
+        unsigned char *b = sPadBuf[i];
+
+        if (b == 0) continue;
+        if (i == 0)
+        {
+            b[0] = 0x00; /* received */
+            b[1] = 0x41; /* digital pad, 1 halfword */
+            b[2] = (unsigned char)~(v >> 8);
+            b[3] = (unsigned char)~v;
+        }
+        else
+        {
+            b[0] = 0xFF; /* nothing there */
+            b[1] = 0;
+        }
+    }
+}
+
+void InitPAD(unsigned char *buf1, long len1, unsigned char *buf2, long len2)
+{
+    sPadBuf[0] = buf1;
+    sPadLen[0] = len1;
+    sPadBuf[1] = buf2;
+    sPadLen[1] = len2;
+    if (buf1 && len1 > 0) buf1[0] = 0xFF;
+    if (buf2 && len2 > 0) buf2[0] = 0xFF;
+}
+
+int StartPAD(void)
+{
+    sPadsOn = 1;
+    pad_buffers();
+    return 1;
+}
+
+void StopPAD(void)
+{
+    sPadsOn = 0;
+}
+
+void ChangeClearPAD(long mode) {}
+
+/* libpad, direct mode */
+void PadInitDirect(unsigned char *pad1, unsigned char *pad2)
+{
+    InitPAD(pad1, 34, pad2, 34);
+}
+
+int PadStartCom(void)
+{
+    return StartPAD();
+}
+
+void PadStopCom(void)
+{
+    StopPAD();
+}
+
+/* PadStateFindCTP1: a pad that has no extended modes */
+int PadGetState(int port)
+{
+    return (port & 0x0F) == 0 && (port & 0x10) == 0 ? 2 : 0;
+}
+
+int PadInfoMode(int port, int term, int offs) { return 0; }
+int PadInfoAct(int port, int acno, int term) { return 0; }
+int PadInfoComb(int port, int term, int offs) { return 0; }
+int PadSetActAlign(int port, unsigned char *data) { return 1; }
+void PadSetAct(int port, unsigned char *data, int len) {}
+int PadSetMainMode(int socket, int offs, int lock) { return 0; }
+int PadChkVsync(void) { return 0; }
 
 /* ---- libcd -------------------------------------------------------------------------------- */
 typedef struct

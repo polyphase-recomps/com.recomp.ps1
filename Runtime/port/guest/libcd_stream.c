@@ -29,6 +29,7 @@
 
 void port_cd_audio_queue(const short *samples, int frames);
 void port_cd_audio_clear(void);
+void port_vblank_catch_up(void);
 
 typedef struct
 {
@@ -324,6 +325,7 @@ unsigned long StGetNext(unsigned long **addr, unsigned long **header)
         {
             sSt.polls = 0;
             sSt.lastPollVblank = port_wait_vblank();
+            port_vblank_catch_up();
         }
         if (!pump()) return 1;
     }

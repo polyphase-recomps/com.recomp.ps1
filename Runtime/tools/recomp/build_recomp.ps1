@@ -249,6 +249,9 @@ if ($stale) {
     $code = $LASTEXITCODE
     Pop-Location
     if ($code -ne 0) { throw "N64Recomp failed ($code)" }
+    # loops the game spins in waiting for an interrupt (Live mode has them from LiveRecomp)
+    & $python (Join-Path $tools 'recomp\ps1_loop_checks.py') $funcs
+    if ($LASTEXITCODE -ne 0) { throw 'ps1_loop_checks.py failed' }
     Set-Content -Path $stamp -Value (Get-Date -Format o)
 }
 

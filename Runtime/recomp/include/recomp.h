@@ -145,6 +145,12 @@ typedef void(recomp_func_t)(uint8_t *rdram, recomp_context *ctx);
 typedef void(recomp_func_ext_t)(uint8_t *rdram, recomp_context *ctx, uintptr_t arg);
 
 recomp_func_t *get_function(int32_t vram);
+
+/* A loop's back edge (tools/recomp/ps1_loop_checks.py): now and then the runtime delivers the
+ * interrupts a spinning loop waits for (recomp_ps1.c). */
+extern int ps1r_loop_budget;
+void ps1r_loop_preempt(uint8_t *rdram, recomp_context *ctx, uint32_t vram);
+#define RECOMP_LOOP_CHECK(vram) do { if (--ps1r_loop_budget < 0) ps1r_loop_preempt(rdram, ctx, (vram)); } while (0)
 #define LOOKUP_FUNC(val) get_function((int32_t)(val))
 
 extern int32_t *section_addresses;

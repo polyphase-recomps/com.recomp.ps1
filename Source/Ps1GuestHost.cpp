@@ -48,6 +48,8 @@ int ps1w_disc_open(const char* path);
 void ps1w_disc_close(void);
 void host_log(const char* fmt, ...);
 void host_crashed(void);
+// (Wasm/ps1w_backend.c) recomp mode's threads: back to the start thread before leaving
+extern int (*ps1w_unwind_hook)(int code);
 }
 
 namespace
@@ -132,6 +134,12 @@ void CheckStop()
 {
     if (sStopRequested)
     {
+        // (a recompiled game's thread: on the start thread's stack first, which comes back to
+        // host_unwind)
+        if (ps1w_unwind_hook != nullptr && ps1w_unwind_hook(2))
+        {
+            return;
+        }
         std::longjmp(sExitJump, 2);
     }
 }
@@ -231,7 +239,17 @@ extern "C" void host_log(const char* fmt, ...)
 extern "C" void host_crashed(void)
 {
     // only ever reached on the game thread (traps, fatal errors, bad guest pointers)
+    if (ps1w_unwind_hook != nullptr && ps1w_unwind_hook(1))
+    {
+        return;
+    }
     std::longjmp(sExitJump, 1);
+}
+
+// recomp mode's threads: leaving the game from the start thread's stack (CheckStop, host_crashed)
+extern "C" void host_unwind(int code)
+{
+    std::longjmp(sExitJump, code);
 }
 
 // ---- script bridge, game thread side (Wasm/ps1w_bridge.h) ------------------------------

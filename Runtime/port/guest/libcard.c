@@ -43,8 +43,12 @@ typedef struct
 {
     unsigned long desc;
     long spec;
+    long mode;
+    long (*func)(void);
     int open, enabled, fired;
 } Event;
+
+#define EV_MD_INTR 0x1000 /* EvMdINTR: the BIOS calls the handler */
 
 static Event sEvents[MAX_EVENTS];
 
@@ -58,6 +62,8 @@ long OpenEvent(unsigned long desc, long spec, long mode, long (*func)())
         {
             sEvents[i].desc = desc;
             sEvents[i].spec = spec;
+            sEvents[i].mode = mode;
+            sEvents[i].func = (long (*)(void))func;
             sEvents[i].open = 1;
             sEvents[i].enabled = 0;
             sEvents[i].fired = 0;
@@ -123,7 +129,8 @@ void DeliverEvent(unsigned long desc, long spec)
     {
         if (sEvents[i].open && sEvents[i].enabled && sEvents[i].desc == desc && sEvents[i].spec == spec)
         {
-            sEvents[i].fired = 1;
+            if ((sEvents[i].mode & EV_MD_INTR) && sEvents[i].func) sEvents[i].func();
+            else sEvents[i].fired = 1;
         }
     }
 }

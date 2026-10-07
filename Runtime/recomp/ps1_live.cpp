@@ -62,6 +62,8 @@ typedef struct
 } Ps1rModHook;
 extern const Ps1rModHook ps1r_mod_hooks[];
 extern const unsigned ps1r_mod_hook_count;
+extern int ps1r_loop_budget;
+void ps1r_loop_preempt(uint8_t *rdram, recomp_context *ctx, uint32_t vram);
 }
 
 #ifndef PS1R_DATA_DIR
@@ -286,7 +288,9 @@ static int live_load()
     for (size_t i = 0; i < game->files.size(); i++)
     {
         std::vector<uint8_t> data;
-        if (!read_disc_file(game->files[i], data)) return fail(game->files[i] + " is not on this disc");
+        // (PRIMARY|ALIAS|...: the same file at several places on the disc; the first is read)
+        const std::string primary = game->files[i].substr(0, game->files[i].find('|'));
+        if (!read_disc_file(primary, data)) return fail(primary + " is not on this disc");
         if (i == 0)
         {
             const std::string json = read_text(base / "game.json");
@@ -359,6 +363,9 @@ static int live_load()
     inputs.ps1_setjmp_fn = reinterpret_cast<void *>(&_setjmp);
     inputs.ps1_setjmp_resume = ps1_setjmp_resume;
     inputs.text_hooks = std::move(text_hooks);
+    // the loops' back edges (as ps1_loop_checks.py adds to the C)
+    inputs.loop_budget = &ps1r_loop_budget;
+    inputs.loop_preempt = ps1r_loop_preempt;
     if (!compile(context, inputs, game->output)) return 0;
 
     // the section table the runtime looks functions up in (as recomp_overlays.inl has it)
@@ -371,6 +378,12 @@ static int live_load()
         {
             const N64Recomp::Function &func = context.functions[index];
             if (func.words.empty()) continue;
+            if (game->output.functions[index] == nullptr)
+            {
+                // (LiveRecomp could not make it: a call to it stops with its address)
+                host_log("recomp (live): %s (%08X) was not recompiled", func.name.c_str(), func.vram);
+                continue;
+            }
             entries.push_back({game->output.functions[index], func.rom - section.rom_addr, (uint32_t)(func.words.size() * 4)});
         }
         if (entries.empty()) continue;
