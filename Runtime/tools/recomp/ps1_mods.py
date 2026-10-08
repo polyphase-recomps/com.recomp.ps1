@@ -147,11 +147,16 @@ def cmd_sources(args):
         print(os.path.normpath(os.path.join(base, s)).replace("\\", "/"))
 
 
+# imports every module has for its mod code (ps1_game_calls.c implements them)
+MOD_RUNTIME_IMPORTS = ["port_game_call"]
+
+
 def cmd_imports(args):
     funcs = load_functions(args[0])
     base = [line.strip() for line in open(args[1], encoding="utf-8") if line.strip()]
+    extra = [n for n in MOD_RUNTIME_IMPORTS if n not in base]
     with open(args[2], "w", encoding="utf-8", newline="\n") as f:
-        for name in base + sorted(set(funcs) - set(base)):
+        for name in base + extra + sorted(set(funcs) - set(base) - set(extra)):
             f.write(name + "\n")
 
 
@@ -279,7 +284,22 @@ def cmd_glue(args):
          '#include "ps1hle_guest.h"',
          "",
          "uint32_t ps1r_call_game(uint32_t vram, int nargs, const uint32_t *args);",
+         "int ps1r_is_function(uint32_t vram);",
+         "void host_log(const char *fmt, ...);",
          ""]
+    if "port_game_call" in imports:
+        # any game function by its address (scripts: a request that calls one), up to 4 arguments
+        g += ["u32 w2c_env_port_game_call(struct w2c_env *env, u32 vram, u32 nargs, u32 a0, u32 a1, u32 a2, u32 a3)",
+              "{",
+              "    const uint32_t args[4] = {a0, a1, a2, a3};",
+              "    (void)env;",
+              "    if (!ps1r_is_function(vram))",
+              "    {",
+              '        host_log("recomp: mod code asked to call %08X, where no function of the game starts", (unsigned)vram);',
+              "        return 0xFFFFFFFFu;",
+              "    }",
+              "    return ps1r_call_game(vram, nargs > 4 ? 4 : (int)nargs, args);",
+              "}", ""]
     calls = 0
     for imp, (ret, params) in sorted(imports.items()):
         if imp not in funcs:

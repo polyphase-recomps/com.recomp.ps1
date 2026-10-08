@@ -202,10 +202,13 @@ static void on_disc_read(uint32_t lba, uint32_t count, uint32_t dst)
     }
 }
 
-static recomp_func_t *find_function(uint32_t vram)
+/* the function starting at vram in a live section; NULL with *inside = the section's index when
+ * vram is in one but starts no function (-1: in none) */
+static recomp_func_t *lookup_function(uint32_t vram, int *inside)
 {
     size_t i;
 
+    *inside = -1;
     for (i = 0; i < sSectionsNum; i++)
     {
         const SectionTableEntry *s = &sSections[i];
@@ -221,9 +224,31 @@ static recomp_func_t *find_function(uint32_t vram)
             if (at < vram) lo = mid + 1;
             else hi = mid;
         }
-        fatal("call to %08X: inside %s but not a function start", vram, ps1r_section_file((unsigned)s->index));
+        *inside = (int)s->index;
+        return NULL;
     }
     return NULL;
+}
+
+static recomp_func_t *find_function(uint32_t vram)
+{
+    int inside;
+    recomp_func_t *func = lookup_function(vram, &inside);
+
+    if (func == NULL && inside >= 0)
+    {
+        fatal("call to %08X: inside %s but not a function start", vram, ps1r_section_file((unsigned)inside));
+    }
+    return func;
+}
+
+/* Whether a function of the game (recompiled, in a loaded section) starts at vram. */
+int ps1r_is_function(uint32_t vram)
+{
+    int inside;
+
+    vram = (vram & 0x1FFFFFFFu) | 0x80000000u;
+    return lookup_function(vram, &inside) != NULL;
 }
 
 recomp_func_t *get_function(int32_t vram_signed)

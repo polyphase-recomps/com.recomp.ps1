@@ -44,6 +44,9 @@ unsigned port_vblank_count(void);
 /* Fast-forward: run the game up to `multiplier` times real time (1 = normal). Hosts
  * hand out vblanks faster, drop the audio and may skip drawing frames meanwhile. */
 void port_set_speed(int multiplier);
+/* Recomp mode, mod code only: runs the game's function at `vram` (up to 4 arguments) and returns
+ * its result; 0xFFFFFFFF, logged, when no function of the game starts there. */
+unsigned port_game_call(unsigned vram, unsigned nargs, unsigned a0, unsigned a1, unsigned a2, unsigned a3);
 /* Host side (not a guest import): the speed in effect, after the host's own timeout. */
 int port_speed(void);
 
